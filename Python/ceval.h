@@ -37,6 +37,7 @@
 #include "pycore_sysmodule.h"     // _PySys_GetOptionalAttrString()
 #include "pycore_template.h"      // _PyTemplate_Build()
 #include "pycore_traceback.h"     // _PyTraceBack_FromFrame
+#include "pycore_tracewal.h"     // _PyWAL_enabled, _PyWAL_On*()
 #include "pycore_tuple.h"         // _PyTuple_ITEMS()
 #include "pycore_uop_ids.h"       // Uops
 

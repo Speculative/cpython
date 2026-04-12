@@ -419,6 +419,284 @@ def async_producer_consumer_wrapper(n_items=500):
 
 
 # ============================================================================
+# 5. REAL-WORLD PATTERNS
+# ============================================================================
+
+import re
+import functools
+
+def pattern_exceptions(n=5000):
+    """Exception handling in hot paths — common in web frameworks, parsers."""
+    data = [{'key': i} if i % 3 != 0 else {'other': i} for i in range(n)]
+    total = 0
+    for item in data:
+        try:
+            total += item['key']
+        except KeyError:
+            try:
+                total += item['other'] * 2
+            except KeyError:
+                pass
+    return total
+
+
+def pattern_string_processing(n=2000):
+    """String manipulation: regex, formatting, parsing — very common."""
+    pattern = re.compile(r'(\w+)=(\d+)')
+    lines = [f'item_{i}={i * 7 % 1000} status={"ok" if i % 5 else "err"} count={i}'
+             for i in range(n)]
+
+    results = []
+    for line in lines:
+        matches = pattern.findall(line)
+        record = {}
+        for key, val in matches:
+            record[key] = int(val)
+        name = line.split(' ')[0]
+        record['name'] = name.upper().replace('_', '-')
+        record['summary'] = f"{record.get('name', '?')}: {sum(record.get(k, 0) for k in record if k != 'name' and k != 'summary')}"
+        results.append(record)
+    return len(results)
+
+
+def pattern_comprehensions(n=5000):
+    """List/dict/set comprehensions — extremely common Python idiom."""
+    data = list(range(n))
+
+    # List comprehension with filter
+    evens = [x * 2 for x in data if x % 2 == 0]
+
+    # Nested comprehension
+    matrix = [[i * j for j in range(20)] for i in range(20)]
+
+    # Dict comprehension
+    index = {f'k{x}': x ** 2 for x in data if x % 7 == 0}
+
+    # Set comprehension
+    unique_mods = {x % 97 for x in data}
+
+    # Generator expression consumed by sum
+    total = sum(x * x for x in evens if x < n)
+
+    return total + len(index) + len(unique_mods) + sum(sum(row) for row in matrix)
+
+
+def pattern_closures_decorators(n=2000):
+    """Closures, decorators, higher-order functions — framework patterns."""
+    def make_validator(min_val, max_val):
+        def validator(x):
+            if x < min_val:
+                return min_val
+            if x > max_val:
+                return max_val
+            return x
+        return validator
+
+    def memoize(func):
+        cache = {}
+        @functools.wraps(func)
+        def wrapper(*args):
+            if args not in cache:
+                cache[args] = func(*args)
+            return cache[args]
+        return wrapper
+
+    @memoize
+    def fib(n):
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
+
+    def apply_pipeline(value, *transforms):
+        for fn in transforms:
+            value = fn(value)
+        return value
+
+    clamp = make_validator(0, 100)
+    double = lambda x: x * 2
+    offset = lambda x: x + 10
+
+    total = 0
+    for i in range(n):
+        total += apply_pipeline(i % 200, clamp, double, offset)
+        if i < 80:
+            total += fib(i)
+    return total
+
+
+def pattern_class_hierarchy(n=3000):
+    """Inheritance, super(), method resolution — OOP-heavy code."""
+    class Base:
+        def __init__(self, value):
+            self.value = value
+            self._cache = None
+
+        def process(self):
+            return self.value * 2
+
+        @property
+        def cached_result(self):
+            if self._cache is None:
+                self._cache = self.process()
+            return self._cache
+
+    class Middle(Base):
+        def __init__(self, value, factor):
+            super().__init__(value)
+            self.factor = factor
+
+        def process(self):
+            base = super().process()
+            return base * self.factor
+
+    class Leaf(Middle):
+        def __init__(self, value, factor, label):
+            super().__init__(value, factor)
+            self.label = label
+            self.history = []
+
+        def process(self):
+            result = super().process()
+            self.history.append(result)
+            return result + len(self.label)
+
+    total = 0
+    objects = []
+    for i in range(n):
+        if i % 3 == 0:
+            obj = Base(i)
+        elif i % 3 == 1:
+            obj = Middle(i, 1.5)
+        else:
+            obj = Leaf(i, 1.5, f'item_{i}')
+        objects.append(obj)
+        total += obj.cached_result
+
+    # Access properties again (should hit cache)
+    for obj in objects:
+        total += obj.cached_result
+
+    return total
+
+
+def pattern_context_managers(n=3000):
+    """Context managers — with statements, __enter__/__exit__."""
+    class Counter:
+        def __init__(self):
+            self.count = 0
+            self.depth = 0
+            self.max_depth = 0
+
+        def __enter__(self):
+            self.depth += 1
+            if self.depth > self.max_depth:
+                self.max_depth = self.depth
+            return self
+
+        def __exit__(self, *args):
+            self.depth -= 1
+            self.count += 1
+            return False
+
+    class Accumulator:
+        def __init__(self):
+            self.total = 0
+            self.items = []
+
+        def __enter__(self):
+            self.items = []
+            return self
+
+        def __exit__(self, *args):
+            self.total += sum(self.items)
+            return False
+
+    counter = Counter()
+    acc = Accumulator()
+    total = 0
+
+    for i in range(n):
+        with counter:
+            with acc:
+                acc.items.append(i)
+                if i % 10 == 0:
+                    with counter:
+                        acc.items.append(i * 2)
+            total += acc.total
+
+    return total + counter.count + counter.max_depth
+
+
+def pattern_kwargs_unpacking(n=3000):
+    """*args/**kwargs, dict unpacking — common in API/framework code."""
+    def make_config(**kwargs):
+        defaults = {'timeout': 30, 'retries': 3, 'verbose': False,
+                    'cache_size': 100, 'mode': 'normal'}
+        config = {**defaults, **kwargs}
+        return config
+
+    def process_request(method, url, *args, headers=None, **params):
+        result = {'method': method, 'url': url, 'n_args': len(args)}
+        if headers:
+            result['headers'] = {**headers}
+        result['params'] = {**params}
+        return sum(len(str(v)) for v in result.values())
+
+    total = 0
+    for i in range(n):
+        cfg = make_config(timeout=i % 60, retries=i % 5,
+                         extra_key=f'val_{i}')
+        total += cfg['timeout'] + cfg['retries'] + cfg['cache_size']
+
+        headers = {'Authorization': f'Bearer token_{i}',
+                   'Content-Type': 'application/json'}
+        total += process_request('GET', f'/api/item/{i}',
+                                 'extra_arg', headers=headers,
+                                 page=i % 10, limit=50)
+    return total
+
+
+def pattern_global_state(n=5000):
+    """Global/module-level state access — common in config, logging, singletons."""
+    _registry = {}
+    _counter = [0]   # mutable to allow modification from nested scope
+    _log = []
+
+    def register(name, value):
+        _counter[0] += 1
+        _registry[name] = {'value': value, 'id': _counter[0]}
+        _log.append(f'registered {name}')
+
+    def lookup(name):
+        entry = _registry.get(name)
+        if entry:
+            _log.append(f'hit {name}')
+            return entry['value']
+        _log.append(f'miss {name}')
+        return None
+
+    def process_batch(items):
+        results = []
+        for name, value in items:
+            register(name, value)
+            looked_up = lookup(name)
+            results.append(looked_up)
+        return results
+
+    batch = [(f'item_{i}', i * 3.14) for i in range(n)]
+    results = process_batch(batch)
+
+    # Re-lookup everything
+    total = 0.0
+    for i in range(0, n, 2):
+        val = lookup(f'item_{i}')
+        if val:
+            total += val
+
+    return total + _counter[0] + len(_log)
+
+
+# ============================================================================
 # WORKLOAD REGISTRY
 # ============================================================================
 
@@ -445,6 +723,16 @@ LARGE_WORKLOADS = {
     'yield_coroutines': lambda: yield_coroutine_sim(100, 20),
     'async_network': lambda: async_network_sync_wrapper(50, 1),
     'async_prodcons': lambda: async_producer_consumer_wrapper(500),
+
+    # Real-world patterns
+    'pat_exceptions': lambda: pattern_exceptions(5000),
+    'pat_strings': lambda: pattern_string_processing(2000),
+    'pat_comprehensions': lambda: pattern_comprehensions(5000),
+    'pat_closures': lambda: pattern_closures_decorators(2000),
+    'pat_classes': lambda: pattern_class_hierarchy(3000),
+    'pat_context': lambda: pattern_context_managers(3000),
+    'pat_kwargs': lambda: pattern_kwargs_unpacking(3000),
+    'pat_global': lambda: pattern_global_state(5000),
 }
 
 # Subset for quicker iteration

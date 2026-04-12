@@ -1829,3 +1829,98 @@ With 64MB buffer and synchronous flush-to-disk on overflow:
 | async_network | 1.21x | 1.19x | -0.02x | 3 MB |
 
 Disk flush adds 0-0.6x overhead for typical workloads. The outlier is mem_classes (729MB, 12 flushes) at +1.4x. Workloads that fit in the 64MB buffer see zero disk overhead during tracing.
+
+---
+
+## Experiment 28: CPython Fork — Inline WAL Tracing
+
+**Goal:** Test whether inlining WAL emission into CPython's bytecode eval loop could reduce overhead below the C extension's ~4x by eliminating settrace dispatch and `PyFrame_GetVar` overhead. Build a complete tracer with feature parity: variable capture, mutations, exceptions, closures, control flow.
+
+**Implementation:** Modified `Python/bytecodes.c` to add `if (_PyWAL_enabled) { _PyWAL_On*(); }` hooks to 18 bytecode handlers. WAL library in `Python/tracewal.c` (~1000 lines). Python module in `Modules/_tracewalmodule.c`. All code generators (`make regen-cases`) accept the changes.
+
+### Hooked bytecode handlers
+
+| Handler | WAL events | Notes |
+|---|---|---|
+| `_SWAP_FAST` (STORE_FAST) | BIND/UNBIND | Old+new value available before POP_TOP closes old |
+| `STORE_FAST_LOAD_FAST`, `STORE_FAST_STORE_FAST` | BIND/UNBIND | Fused store variants |
+| `_STORE_SUBSCR` + `_STORE_SUBSCR_LIST_INT` + `_STORE_SUBSCR_DICT` | SETITEM | All STORE_SUBSCR paths |
+| `_STORE_ATTR` + `_STORE_ATTR_INSTANCE_VALUE` + `_STORE_ATTR_WITH_HINT` + `_STORE_ATTR_SLOT` | SETATTR | All STORE_ATTR paths |
+| `DELETE_SUBSCR`, `DELETE_ATTR` | DELITEM, DELATTR | |
+| `STORE_GLOBAL`, `STORE_NAME` | SETATTR on globals/locals dict | Module-level / class-body stores |
+| `STORE_DEREF` | BIND/UNBIND on cell variable | Closures and nonlocal mutations |
+| `_RETURN_VALUE` | UNBIND (all locals) + RETURN | Before frame teardown |
+| `_YIELD_VALUE` | RETURN (no unbind) | Before frame suspension |
+| `_WAL_RESUME` (new tier1 op) | CALL + BIND (args) | Added to RESUME, RESUME_CHECK, RESUME_CHECK_JIT, INSTRUMENTED_RESUME |
+| `_DO_CALL` | MUTATE (known mutating methods) | Checks for append/insert/sort/etc. + schedules snapshots |
+| `_CALL_LIST_APPEND` | MUTATE | Specialized fast path |
+| `RAISE_VARARGS`, `RERAISE`, error label | RAISE (type + message + origin line) | |
+| `PUSH_EXC_INFO` | EXCEPT (type) | Entering except handler |
+| `_POP_JUMP_IF_TRUE/FALSE` | LINE (post-jump) | Branch destination, mode >= 1 |
+| `JUMP_FORWARD`, `JUMP_BACKWARD_NO_INTERRUPT` | LINE (post-jump) | Jump destination, mode >= 1 |
+| `_FOR_ITER` | LINE | Loop iteration, mode >= 1 |
+| DISPATCH macro | LINE | Every instruction, mode 2 only |
+
+### Critical fix: RESUME_CHECK specialization
+
+RESUME gets specialized to RESUME_CHECK after the first call to a function (`_QUICKEN_RESUME`). Initial implementation only hooked RESUME, so only the first invocation of each function was traced. This produced artificially low overhead (~1.0x) because most calls were silently untraced. Fix: added `_WAL_RESUME` to RESUME_CHECK, RESUME_CHECK_JIT, and INSTRUMENTED_RESUME macro compositions. After fix, all Python function calls are correctly traced.
+
+### Correctness: 124/124 conformance tests pass
+
+Test suite in `exp28_fork_tracewal/tests/test_wal_conformance.py` covers:
+
+| Category | Tests |
+|---|---|
+| Variable capture (primitives, mutables, reassignment, args, unpacking) | 5 |
+| Object mutations (SETATTR, SETITEM, DELITEM, DELATTR) | 4 |
+| Mutating method calls (list, dict, set) | 3 |
+| Control flow (call/return, branches, no-store branches, for/while, nested) | 6 |
+| Exceptions (explicit raise, C-level raise, handler, nested, origin line) | 5 |
+| Object identity (aliasing, cross-function OID) | 2 |
+| Generators (basic, pipeline, send) | 3 |
+| Global/nonlocal/closure (global vars, nonlocal, returned closure, shared cell) | 4 |
+| Post-mutation snapshots (list sort/reverse, set pop, deque reverse/rotate, list pop no-snapshot) | 7 |
+| Complex patterns (class hierarchy, context manager, decorator, comprehension, recursion, exception+mutation) | 6 |
+| LINE mode comparison (mode 0/1/2) | 3 |
+
+### Three LINE tracking modes
+
+- **Mode 0 (stores only)**: Events at STORE/CALL/RETURN/RAISE/EXCEPT/MUTATE. No per-dispatch LINE check. Straight-line code between events is inferrable from source analysis.
+- **Mode 1 (control flow)**: Adds LINE after branch/loop/jump resolution. Fires at `POP_JUMP_IF_*`, `FOR_ITER`, `JUMP_FORWARD`, `JUMP_BACKWARD_NO_INTERRUPT`. Emits the destination line (after `JUMPBY`), so replayer knows which branch was taken.
+- **Mode 2 (full LINE)**: `_PyWAL_CheckLine` in DISPATCH macro fires on every instruction. Currently expensive due to `PyCode_Addr2Line` per instruction.
+
+### Performance: 23 workloads, 6 categories
+
+Apples-to-apples comparison with C extension in both stores-only and +LINE modes (10 rounds, 23 workloads):
+
+| Category | C noop | C ext (stores) | C ext (+LINE) | Fork mode 0 | Fork mode 1 |
+|---|---|---|---|---|---|
+| Compute (4) | 1.5x | 4.5x | 4.7x | 1.2x | 1.6x |
+| IO (3) | 1.3x | 1.6x | 1.6x | 1.2x | 1.3x |
+| Memory (4) | 1.4x | 3.8x | 3.9x | 1.2x | 1.7x |
+| Yield (2) | 2.4x | 6.6x | 6.4x | 2.2x | 3.9x |
+| Async (2) | 0.7x | 0.7x | 0.6x | 0.5x | 0.6x |
+| Pattern (8) | 1.7x | 4.6x | 4.7x | 1.5x | 1.8x |
+| **ALL (23)** | **1.6x** | **~3.9x** | **~3.9x** | **~1.3x** | **~1.8x** |
+
+Fork mode 2 (per-instruction LINE via `PyCode_Addr2Line` in DISPATCH) is ~21x. This is *worse* than the C extension's ~4x because the fork polls `PyCode_Addr2Line` on every bytecode instruction (many per source line), while settrace only fires once per source line change. Not a useful operating point without line table caching.
+
+### Analysis
+
+**Fork mode 0 at 1.3x is the headline result.** Full variable state capture, mutation tracking, exceptions, closures, and call/return at overhead *below the settrace noop floor* (1.6x). This proves the WAL logic itself is genuinely cheap — the fork's overhead comes from `get_current_line()` calls at each hook, not from WAL buffer writes or OID lookups.
+
+**Fork mode 1 at 1.8x adds only +0.5x for full control flow.** Branch destinations, loop iterations, exception jumps — enough for a replayer to reconstruct which lines executed. This is the recommended mode for debugger-style reconstruction.
+
+**Skipping LINE emission saves nothing for the C extension** (3.9x → 3.9x). The bottleneck is structural: settrace callback dispatch + `PyFrame_GetVar` on every LINE event. Even when the C extension doesn't emit WAL_LINE entries, it still receives and processes every LINE callback, reads variables via `PyFrame_GetVar`, and does frame cache lookups. The WAL entry write itself is negligible.
+
+**The C extension's 3.9x stores-only overhead is 3.0x above the fork's 1.3x.** This gap is entirely attributable to:
+1. Settrace dispatch overhead (~50-100ns/event) — every LINE event fires the callback even when no WAL entry is emitted
+2. `PyFrame_GetVar` O(n) name lookup (~100ns/read) — vs `localsplus[i]` (~1ns)
+3. `PyFrameObject` materialization — settrace forces lazy frame object creation
+4. `PyFrame_GetCode` INCREF/DECREF — vs `_PyFrame_GetCode` borrowed ref
+
+**Why fork mode 2 is slower than the C extension's full LINE tracking:** The DISPATCH macro fires on every bytecode instruction (~10-50 per source line). Each call to `_PyWAL_CheckLine` invokes `PyCode_Addr2Line` which walks the line table. Even though the result is deduplicated (same line → skip), the per-instruction overhead from the function call + line table decode dwarfs the settrace approach where CPython's own instrumentation machinery handles line deduplication internally and only fires the callback on actual line changes.
+
+### Performance benchmark suite
+
+`exp28_fork_tracewal/tests/bench_performance.py` — 23 workloads across 6 categories (compute, IO, memory, yield, async, pattern). Reusable harness with CLI flags: `--quick`, `--fork-only`, `--rounds=N`, `--warmup=N`. Workloads defined in `workloads_large.py`.

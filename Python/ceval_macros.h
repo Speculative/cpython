@@ -196,9 +196,34 @@ do { \
 #endif
 
 
+/* Lightweight per-instruction line tracking for WAL tracing.
+ * Emits WAL_LINE when the source line changes. The branch on
+ * _PyWAL_enabled is predicted-not-taken when tracing is off. */
+extern int _PyWAL_enabled;
+extern int _PyWAL_line_mode;
+extern void _PyWAL_CheckLine(_PyInterpreterFrame *frame);
+
+/* LINE tracking modes:
+ * 0 = stores only (no per-dispatch LINE)
+ * 1 = control flow (LINE at branches, loops, calls — via specific hooks)
+ * 2 = full (LINE at every source line change) */
+#define _WAL_LINE_CHECK() \
+    if (_PyWAL_enabled && _PyWAL_line_mode >= 2) { \
+        frame->instr_ptr = next_instr; \
+        _PyWAL_CheckLine(frame); \
+    }
+
+/* For use after JUMPBY in branch/loop ops — sets instr_ptr to where we jumped */
+#define _WAL_LINE_CHECK_JUMPED() \
+    if (_PyWAL_enabled && _PyWAL_line_mode >= 1) { \
+        frame->instr_ptr = next_instr; \
+        _PyWAL_CheckLine(frame); \
+    }
+
 /* Do interpreter dispatch accounting for tracing and instrumentation */
 #define DISPATCH() \
     { \
+        _WAL_LINE_CHECK(); \
         assert(frame->stackpointer == NULL); \
         NEXTOPARG(); \
         PRE_DISPATCH_GOTO(); \

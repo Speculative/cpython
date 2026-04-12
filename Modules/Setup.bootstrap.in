@@ -11,6 +11,7 @@ faulthandler faulthandler.c
 posix posixmodule.c
 _signal signalmodule.c
 _tracemalloc _tracemalloc.c
+_tracewal _tracewalmodule.c
 _suggestions _suggestions.c
 # needs libm and on some platforms librt
 _datetime _datetimemodule.c

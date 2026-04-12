@@ -253,6 +253,9 @@ static uint64_t g_stat_line_events = 0;
 static uint64_t g_stat_mutations_recorded = 0;
 static uint64_t g_stat_getvar_calls = 0;
 
+/* LINE mode: 0 = no LINE emission, 1 = emit LINE for every source line */
+static int g_line_mode = 1;
+
 /* ========================================================================
  * Compact WAL byte-stream buffer
  *
@@ -678,8 +681,8 @@ static int trace_wal(PyObject *self, PyFrameObject *frame, int what, PyObject *a
 
     if (what != PyTrace_LINE) { Py_DECREF(code); return 0; }
 
-    /* Emit LINE flow event */
-    {
+    /* Emit LINE flow event (if line_mode enabled) */
+    if (g_line_mode) {
         int32_t ln = PyFrame_GetLineNumber(frame);
         uint8_t *p = wal_reserve(15);
         if (p) { wal_write_header(&p, WAL_LINE, 0, ln, code_idx >= 0 ? code_idx : 0); wal_finish(p); }
@@ -1006,12 +1009,15 @@ ctrace_wal_register_code(PyObject *self, PyObject *args)
 static PyObject *
 ctrace_wal_start(PyObject *self, PyObject *args, PyObject *kwargs)
 {
-    static char *kwlist[] = {"buf_size", "output_file", NULL};
+    static char *kwlist[] = {"buf_size", "output_file", "line_mode", NULL};
     int buf_size = WAL_BUF_DEFAULT;
     const char *output_file = NULL;
+    int line_mode = -1;
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|iz", kwlist, &buf_size, &output_file))
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|izi", kwlist, &buf_size, &output_file, &line_mode))
         return NULL;
+
+    if (line_mode >= 0) g_line_mode = line_mode;
 
     if (g_wal_buf) PyMem_Free(g_wal_buf);
     g_wal_buf = (uint8_t *)PyMem_Calloc(1, buf_size);
