@@ -799,6 +799,22 @@ def test_closure_shared_cell():
 # 9. Post-mutation snapshots
 # ===================================================================
 
+def _snapshots_after_mutate(wal):
+    """Get SNAPSHOT events that follow a MUTATE event (post-mutation snapshots).
+    Excludes initial creation snapshots."""
+    result = []
+    prev_was_mutate = False
+    for e in wal:
+        if e['event'] == 'MUTATE':
+            prev_was_mutate = True
+        elif e['event'] == 'SNAPSHOT' and prev_was_mutate:
+            result.append(e)
+            prev_was_mutate = False
+        else:
+            prev_was_mutate = False
+    return result
+
+
 def test_sort_snapshot():
     """list.sort() produces MUTATE + SNAPSHOT with sorted contents."""
     print("\n--- 9a: list.sort() snapshot ---")
@@ -810,8 +826,8 @@ def test_sort_snapshot():
 
     wal, result = run_traced(target)
     check("result correct", result == [1, 2, 4, 5, 8])
-    snapshots = events_of_type(wal, 'SNAPSHOT')
-    check("SNAPSHOT emitted", len(snapshots) >= 1, f"{snapshots}")
+    snapshots = _snapshots_after_mutate(wal)
+    check("post-mutation SNAPSHOT emitted", len(snapshots) >= 1, f"{snapshots}")
     if snapshots:
         check("snapshot has sorted contents",
               snapshots[0].get('items') == [1, 2, 4, 5, 8],
@@ -829,8 +845,8 @@ def test_reverse_snapshot():
 
     wal, result = run_traced(target)
     check("result correct", result == [3, 2, 1])
-    snapshots = events_of_type(wal, 'SNAPSHOT')
-    check("SNAPSHOT emitted", len(snapshots) >= 1, f"{snapshots}")
+    snapshots = _snapshots_after_mutate(wal)
+    check("post-mutation SNAPSHOT emitted", len(snapshots) >= 1, f"{snapshots}")
     if snapshots:
         check("snapshot has reversed contents",
               snapshots[0].get('items') == [3, 2, 1],
@@ -838,7 +854,7 @@ def test_reverse_snapshot():
 
 
 def test_sort_then_reverse():
-    """sort() followed by reverse() produces two snapshots."""
+    """sort() followed by reverse() produces two post-mutation snapshots."""
     print("\n--- 9c: sort + reverse ---")
 
     def target():
@@ -849,8 +865,8 @@ def test_sort_then_reverse():
 
     wal, result = run_traced(target)
     check("result correct", result == [5, 4, 3, 1, 1])
-    snapshots = events_of_type(wal, 'SNAPSHOT')
-    check("two SNAPSHOTs", len(snapshots) == 2, f"got {len(snapshots)}")
+    snapshots = _snapshots_after_mutate(wal)
+    check("two post-mutation SNAPSHOTs", len(snapshots) == 2, f"got {len(snapshots)}")
     if len(snapshots) == 2:
         check("first snapshot sorted", snapshots[0].get('items') == [1, 1, 3, 4, 5],
               f"{snapshots[0].get('items')}")
@@ -869,8 +885,8 @@ def test_set_pop_snapshot():
 
     wal, result = run_traced(target)
     check("result has 2 elements", len(result) == 2)
-    snapshots = events_of_type(wal, 'SNAPSHOT')
-    check("SNAPSHOT emitted for set.pop", len(snapshots) >= 1, f"{snapshots}")
+    snapshots = _snapshots_after_mutate(wal)
+    check("post-mutation SNAPSHOT for set.pop", len(snapshots) >= 1, f"{snapshots}")
     if snapshots:
         check("snapshot has 2 items", len(snapshots[0].get('items', [])) == 2,
               f"{snapshots[0].get('items')}")
@@ -889,8 +905,8 @@ def test_deque_reverse_snapshot():
 
     wal, result = run_traced(target)
     check("result correct", list(result) == [3, 2, 1])
-    snapshots = events_of_type(wal, 'SNAPSHOT')
-    check("SNAPSHOT emitted for deque.reverse", len(snapshots) >= 1, f"{snapshots}")
+    snapshots = _snapshots_after_mutate(wal)
+    check("post-mutation SNAPSHOT for deque.reverse", len(snapshots) >= 1, f"{snapshots}")
     if snapshots:
         check("snapshot has reversed contents",
               snapshots[0].get('items') == [3, 2, 1],
@@ -910,8 +926,8 @@ def test_deque_rotate_snapshot():
 
     wal, result = run_traced(target)
     check("result correct", list(result) == [3, 4, 1, 2])
-    snapshots = events_of_type(wal, 'SNAPSHOT')
-    check("SNAPSHOT emitted for deque.rotate", len(snapshots) >= 1, f"{snapshots}")
+    snapshots = _snapshots_after_mutate(wal)
+    check("post-mutation SNAPSHOT for deque.rotate", len(snapshots) >= 1, f"{snapshots}")
     if snapshots:
         check("snapshot has rotated contents",
               snapshots[0].get('items') == [3, 4, 1, 2],
@@ -919,7 +935,7 @@ def test_deque_rotate_snapshot():
 
 
 def test_list_pop_no_snapshot():
-    """list.pop() should NOT produce a snapshot (reconstructable)."""
+    """list.pop() should NOT produce a post-mutation snapshot (reconstructable)."""
     print("\n--- 9g: list.pop() no snapshot ---")
 
     def target():
@@ -930,10 +946,11 @@ def test_list_pop_no_snapshot():
 
     wal, result = run_traced(target)
     check("result correct", result == [20])
-    snapshots = events_of_type(wal, 'SNAPSHOT')
+    post_mut_snapshots = _snapshots_after_mutate(wal)
     mutates = [e for e in events_of_type(wal, 'MUTATE') if e.get('method') == 'pop']
     check("pop MUTATE events captured", len(mutates) >= 2, f"got {len(mutates)}")
-    check("NO snapshot for list.pop", len(snapshots) == 0, f"got {len(snapshots)}: {snapshots}")
+    check("NO post-mutation snapshot for list.pop", len(post_mut_snapshots) == 0,
+          f"got {len(post_mut_snapshots)}: {post_mut_snapshots}")
 
 
 # ===================================================================

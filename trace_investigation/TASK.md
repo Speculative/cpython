@@ -13,19 +13,19 @@ The tracer should:
 
 ## Current Status
 
-Two working tracer backends producing a **Write-Ahead Log (WAL)** — an object-centric event log that tracks object lifecycles, variable bindings, mutations, control flow, and exceptions. Both are validated by a 112-test conformance suite.
+Two working tracer backends producing a **Write-Ahead Log (WAL)** — an object-centric event log that tracks object lifecycles, variable bindings, mutations, control flow, and exceptions. Validated by a 124-test conformance suite and a 42-test differential suite that verifies WAL reconstruction matches settrace ground truth.
 
 ### Backend 1: C Extension (`_ctrace_wal`) — pip-installable
 
 Uses `PyEval_SetTrace` with a C-level `Py_tracefunc` callback. Reads variables via `PyFrame_GetVar`. Requires pre-computed bytecode analysis (Python-side) to register code objects.
 
-**Overhead: ~4x** (23 workloads, compact WAL + disk persistence)
+**Overhead: ~4.2x** (31 workloads, compact WAL + disk persistence)
 
 ### Backend 2: CPython Fork (`_tracewal`) — inline eval loop hooks
 
-Modifies `Python/bytecodes.c` directly, adding `if (_PyWAL_enabled) { ... }` hooks to 18 bytecode handlers. Uses `frame->localsplus[i]` for direct local access, `_PyFrame_GetCode()` for borrowed refs. No settrace, no frame materialization, no bytecode pre-analysis needed.
+Modifies `Python/bytecodes.c` directly, adding `if (_PyWAL_enabled) { ... }` hooks to 18 bytecode handlers. Uses `frame->localsplus[i]` for direct local access, `_PyFrame_GetCode()` for borrowed refs. No settrace, no frame materialization, no bytecode pre-analysis needed. Pre-computed offset→line lookup table per code object eliminates `PyCode_Addr2Line` from the hot path.
 
-**Overhead: ~1.8x** (mode 0, stores + calls only, 23 workloads)
+**Overhead: ~1.4x** (mode 0), **~2.2x** (mode 1, recommended). 31 workloads with disk persistence.
 
 ### What both backends capture
 - **Variable bindings** (BIND/UNBIND) — every STORE_FAST, including function arguments at call time
@@ -40,33 +40,36 @@ Modifies `Python/bytecodes.c` directly, adding `if (_PyWAL_enabled) { ... }` hoo
 - **Post-mutation snapshots** — full container contents after opaque C mutations: `list.sort()`, `list.reverse()`, `set.pop()`, `deque.reverse()`, `deque.rotate()`. Not triggered for reconstructable mutations like `list.pop()`, `dict.pop()`. (fork only)
 
 ### Fork LINE tracking modes
-- **Mode 0 (stores only, ~1.8x)**: Events at STORE/CALL/RETURN/RAISE/EXCEPT. Straight-line code between stores is inferrable from source.
-- **Mode 1 (control flow, ~3.7x)**: Adds LINE at branch destinations (`POP_JUMP_IF_*`), loop headers (`FOR_ITER`), and jump targets. Sufficient to reconstruct which branch was taken, how many loop iterations ran, and where exceptions jumped to.
-- **Mode 2 (full LINE, ~21x)**: LINE on every source line change. Currently expensive due to `PyCode_Addr2Line` being called per-instruction — needs line table caching optimization.
+- **Mode 0 (stores only, ~1.4x)**: Events at STORE/CALL/RETURN/RAISE/EXCEPT/MUTATE. Straight-line code between stores is inferrable from source. Cannot resolve branches where neither path has a store, or while loops with no stores in the body.
+- **Mode 1 (control flow, ~2.2x)**: Adds LINE at branch destinations (`POP_JUMP_IF_*`), loop headers (`FOR_ITER`), and jump targets. Sufficient to reconstruct which branch was taken, how many loop iterations ran, and where exceptions jumped to. Recommended mode for debugger-style replay. State reconstruction validated by 42-test differential suite.
+- **Mode 2 (full LINE)**: LINE on every source line change via DISPATCH macro. Uses the same offset→line table as modes 0/1, so no longer bottlenecked by `PyCode_Addr2Line`, but fires on every bytecode instruction.
 
-### Performance (23 workloads, 6 categories)
+### Performance (31 workloads, 7 categories, with disk persistence)
 
-| Category | C noop | C ext (stores) | C ext (+LINE) | Fork mode 0 | Fork mode 1 |
-|---|---|---|---|---|---|
-| Compute (4) | 1.5x | 4.5x | 4.7x | 1.2x | 1.6x |
-| IO (3) | 1.3x | 1.6x | 1.6x | 1.2x | 1.3x |
-| Memory (4) | 1.4x | 3.8x | 3.9x | 1.2x | 1.7x |
-| Yield (2) | 2.4x | 6.6x | 6.4x | 2.2x | 3.9x |
-| Async (2) | 0.7x | 0.7x | 0.6x | 0.5x | 0.6x |
-| Pattern (8) | 1.7x | 4.6x | 4.7x | 1.5x | 1.8x |
-| **ALL (23)** | **1.6x** | **~3.9x** | **~3.9x** | **~1.3x** | **~1.8x** |
+All measurements use `output_file=/dev/null` to flush the 64MB WAL buffer when full (realistic production behavior) without actual disk I/O. This ensures no silent entry dropping from buffer overflow.
+
+| Category | C noop | C ext WAL | Fork mode 0 | Fork mode 1 |
+|---|---|---|---|---|
+| Compute (4) | 1.5x | 4.9x | 1.2x | 3.0x |
+| IO (3) | 1.3x | 1.6x | 1.2x | 1.3x |
+| Memory (4) | 1.5x | 4.0x | 1.2x | 2.2x |
+| Yield (2) | 2.5x | 7.7x | 2.5x | 4.2x |
+| Async (2) | 0.7x | 0.7x | 0.6x | 0.7x |
+| Pattern (8) | 1.7x | 5.8x | 1.5x | 2.3x |
+| Stress (8) | 1.5x | 3.4x | 1.3x | 2.0x |
+| **ALL (31)** | **1.5x** | **~4.2x** | **~1.4x** | **~2.2x** |
 
 Key insights:
-- **Skipping LINE emission saves nothing for the C extension** (3.9x → 3.9x). The bottleneck is settrace dispatch + PyFrame_GetVar on every LINE event, not the WAL entry write. The C extension pays the full settrace callback overhead even when it doesn't emit LINE entries.
-- **Fork mode 0 at 1.3x is below the settrace noop floor (1.6x).** The WAL logic itself is genuinely cheap — the fork's overhead is entirely from `get_current_line()` calls at each store hook.
-- **Fork mode 1 at 1.8x adds only +0.5x over stores-only** for full control flow reconstruction (branches, loops, exception jumps). This is the recommended mode for debugger-style replay.
-- **Fork mode 2 (per-instruction LINE) is ~21x** — much worse than the C extension's ~4x because the fork polls `PyCode_Addr2Line` on every bytecode instruction (many per source line), while settrace only fires once per source line change. Needs line table caching to be practical.
+- **Fork mode 1 at 2.2x is roughly half the C extension's 4.2x overhead.** The difference comes from eliminating settrace dispatch + `PyFrame_GetVar` + frame materialization.
+- **Fork mode 0 at 1.4x is below the settrace noop floor (1.5x).** The WAL logic itself is genuinely cheap.
+- **Mode 1 adds +0.8x over mode 0** for full control flow reconstruction (branches, loops, exception jumps).
+- **Pre-computed offset→line tables** eliminate `PyCode_Addr2Line` from the hot path. Before this optimization, mode 1 was 3.2x; `PyCode_Addr2Line` accounted for 78% of traced execution time.
+- **State reconstruction validated.** A 42-test differential suite verifies that WAL mode 1 capture + offline replay produces the same variable and object values at function returns as settrace ground truth, across complex programs (recursion, co-recursion, closures, generators, exceptions, nested containers, decorators, context managers, match/case, for/else, try/finally, etc.).
 
 ### Known limitations
 - Threading not yet supported (single-thread only)
-- id() reuse for built-in types relies on scope-based inference (weakref not supported on built-in types)
-- No WAL replay / state reconstruction viewer yet
-- Mode 2 LINE tracking needs `PyCode_Addr2Line` caching to be practical
+- id() reuse for tuples: each encounter creates a new oid (tuples are immutable, so reuse is indistinguishable from new object)
+- No WAL replay / state reconstruction viewer yet (replayer exists but no UI)
 - C extensions modifying objects outside Python bytecode are invisible (except known mutating methods)
 - Bytecode analysis for value resolution (C extension only) can be affected by fused LOAD_FAST opcodes in newer CPython versions (handled for 3.15)
 
@@ -74,8 +77,9 @@ Key insights:
 
 | Suite | Location | Tests | What it covers |
 |---|---|---|---|
-| Conformance | `exp28_fork_tracewal/tests/test_wal_conformance.py` | 124 | All WAL event types, control flow, exceptions, closures, generators, snapshots (list/set/deque), LINE modes |
-| Performance | `exp28_fork_tracewal/tests/bench_performance.py` | 23 workloads | Overhead measurement across compute/IO/memory/yield/async/pattern categories |
+| Conformance | `exp28_fork_tracewal/tests/test_wal_conformance.py` | 124 | All WAL event types, control flow, exceptions, closures, generators, snapshots (list/dict/set/deque/tuple), LINE modes |
+| Differential | `exp28_fork_tracewal/tests/test_differential.py` | 42 | WAL reconstruction vs settrace ground truth: compares variable/object state at every function return. Covers recursion, co-recursion, closures, generators, exceptions, nested containers, decorators, context managers, match/case, for/else, try/finally, walrus operator, star unpacking, etc. |
+| Performance | `exp28_fork_tracewal/tests/bench_performance.py` | 31 workloads | Overhead measurement across compute/IO/memory/yield/async/pattern/stress categories. Uses `/dev/null` disk flush to prevent buffer overflow artifacts. |
 | C ext correctness | `exp27_c_extension/exp27_wal_c.py` | 16 | Original C extension tests (subset of conformance suite) |
 
 ## Dead Ends and Lessons Learned
@@ -100,7 +104,8 @@ These findings may save time for future investigation:
 - **Yield overhead is inherent, not a bug.** Generator yields produce 3 trace events (CALL + LINE + RETURN) per element per pipeline stage. Generators that do ~4ns of work per yield pay ~200ns per trace event — 50x ratio. Real programs with meaningful work per yield see 2-3x, not 50x.
 - **Inline bytecode hooks achieve ~1.3x overhead (mode 0, stores + calls).** A CPython fork adding `if (_PyWAL_enabled)` checks to 18 bytecode handlers captures full variable state, object mutations, control flow, exceptions, and closure variables at 1.3x overhead (23 workloads). Early measurements showed ~1.0x but were incorrect — RESUME specialization to RESUME_CHECK meant most function calls were silently untraced. After fixing RESUME_CHECK, the correct overhead is 1.3x — below the settrace noop floor (1.6x). Adding control-flow LINE tracking (mode 1) brings it to 1.8x.
 - **RESUME gets specialized to RESUME_CHECK after the first call.** The `_QUICKEN_RESUME` op in the RESUME macro rewrites RESUME → RESUME_CHECK after the first execution. RESUME_CHECK skips the instrumentation version check. Any hook added to the RESUME macro must also be added to RESUME_CHECK, RESUME_CHECK_JIT, and INSTRUMENTED_RESUME, or subsequent calls to hot functions will be silently untraced.
-- **`PyCode_Addr2Line` is too expensive for per-instruction LINE tracking.** Adding a `_PyWAL_CheckLine` call (which invokes `PyCode_Addr2Line`) to the DISPATCH macro results in ~21x overhead. The line table decoder is designed for occasional use (tracebacks), not every-instruction use. For practical full-LINE mode, need to cache the offset→line mapping per code object or use a precomputed table.
+- **`PyCode_Addr2Line` was 78% of traced execution time.** Profiling with `perf` showed that `PyCode_Addr2Line` (called from `get_current_line()` in every store/mutation hook) dominated the fork's overhead. The line table decoder walks a compressed table on every call. Fix: pre-compute an `offset→line` lookup table per code object at registration time. This reduced fork mode 1 from 3.2x to 2.2x and mode 0 from 1.65x to 1.4x. The lookup is now a single array index per call.
+- **Benchmark buffer overflow silently skews measurements.** With a 64MB WAL buffer and no disk output, high-event workloads (comp_primes: 54K events/iter × 50 iters = full buffer) caused `wal_reserve` to return NULL, silently dropping events. The hooks still fire (same CPU cost) but the WAL data is lost. This didn't affect overhead measurements, but it means the WAL stats showed 0 entries. Fix: always use `output_file='/dev/null'` in benchmarks to flush the buffer when full (realistic production behavior). This also revealed the C extension's true overhead with disk flush (~4.2x, up from ~3.9x without flush).
 - **Control-flow-only LINE tracking (mode 1) gives full branch reconstruction at ~3.7x.** Hooking only `POP_JUMP_IF_TRUE/FALSE`, `FOR_ITER`, `JUMP_FORWARD`, and `JUMP_BACKWARD_NO_INTERRUPT` — after the jump resolves — captures which branch was taken, which loop iterations ran, and where exceptions jumped to. Combined with BIND events (which carry line numbers), a replayer can infer straight-line execution between control flow points.
 - **Branch LINE events must fire AFTER JUMPBY, not before.** The `POP_JUMP_IF_*` ops modify `next_instr` via `JUMPBY`, but `frame->instr_ptr` is set at the handler's top to the pre-jump value. To emit the destination line (which branch was taken), set `frame->instr_ptr = next_instr` after JUMPBY before calling `_PyWAL_CheckLine`.
 - **CPython's bytecodes.c DSL accepts side-effectful calls in op bodies.** Adding `if (...) { func(); }` inside `op()` and `inst()` bodies works — the code generator passes them through as raw C, similar to `STAT_INC()` and `LLTRACE_RESUME_FRAME()`. The `replicate(8)` annotation correctly propagates the hook to all specialized variants. All 7 generators (`make regen-cases`) accept the modified bytecodes.c without errors.

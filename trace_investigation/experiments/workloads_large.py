@@ -697,6 +697,97 @@ def pattern_global_state(n=5000):
 
 
 # ============================================================================
+# 6. TRACER STRESS PATTERNS
+# ============================================================================
+
+def stress_large_container_creation(n=200):
+    """Creates many large containers — stresses initial snapshot serialization."""
+    results = []
+    for i in range(n):
+        big_list = list(range(100))
+        big_dict = {f'k{j}': j for j in range(50)}
+        big_set = set(range(80))
+        results.append(len(big_list) + len(big_dict) + len(big_set))
+    return sum(results)
+
+
+def stress_tight_nonlocal(n=50000):
+    """Tight loop mutating a nonlocal variable — stresses STORE_DEREF."""
+    total = 0
+    def accumulate(val):
+        nonlocal total
+        total += val
+    for i in range(n):
+        accumulate(i)
+    return total
+
+
+def stress_many_short_objects(n=20000):
+    """Creates/discards many objects — stresses OID map churn."""
+    total = 0
+    for i in range(n):
+        obj = {'value': i, 'items': [i, i+1, i+2]}
+        total += obj['value'] + sum(obj['items'])
+    return total
+
+
+def stress_setitem_loop(n=5000):
+    """Writes to list by index in a loop — stresses STORE_SUBSCR path."""
+    items = [0] * n
+    for i in range(n):
+        items[i] = i * 3 + 1
+    # Also dict by key
+    d = {}
+    for i in range(n):
+        d[i] = i * 2
+    return items[-1] + len(d)
+
+
+def stress_deep_calls(depth=500):
+    """Deep recursive calls — stresses frame cache stack."""
+    def recurse(n, acc):
+        if n <= 0:
+            return acc
+        return recurse(n - 1, acc + n)
+    return recurse(depth, 0)
+
+
+def stress_no_store_loop(n=50000):
+    """Tight loop with no stores in body — stresses mode 1 LINE overhead."""
+    items = list(range(100))
+    total = 0
+    for _ in range(n):
+        total += len(items)  # len() is a C call, no store except total
+    return total
+
+
+def stress_many_small_calls(n=20000):
+    """Many calls to trivial functions — stresses RESUME/RETURN overhead."""
+    def add1(x):
+        return x + 1
+    def double(x):
+        return x * 2
+    def negate(x):
+        return -x
+    val = 0
+    for i in range(n):
+        val = add1(val)
+        val = double(val)
+        val = negate(val)
+    return val
+
+
+def stress_long_strings(n=5000):
+    """Variables bound to long strings — stresses value serialization truncation."""
+    results = []
+    for i in range(n):
+        s = f"item_{i}_" + "x" * 200
+        t = s[:100] + s[100:]
+        results.append(len(t))
+    return sum(results)
+
+
+# ============================================================================
 # WORKLOAD REGISTRY
 # ============================================================================
 
@@ -733,6 +824,16 @@ LARGE_WORKLOADS = {
     'pat_context': lambda: pattern_context_managers(3000),
     'pat_kwargs': lambda: pattern_kwargs_unpacking(3000),
     'pat_global': lambda: pattern_global_state(5000),
+
+    # Tracer stress patterns
+    'stress_snapshots': lambda: stress_large_container_creation(200),
+    'stress_nonlocal': lambda: stress_tight_nonlocal(50000),
+    'stress_oid_churn': lambda: stress_many_short_objects(20000),
+    'stress_setitem': lambda: stress_setitem_loop(5000),
+    'stress_deep_calls': lambda: stress_deep_calls(500),
+    'stress_no_store': lambda: stress_no_store_loop(50000),
+    'stress_small_calls': lambda: stress_many_small_calls(20000),
+    'stress_strings': lambda: stress_long_strings(5000),
 }
 
 # Subset for quicker iteration

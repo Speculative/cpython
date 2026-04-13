@@ -1865,7 +1865,7 @@ Disk flush adds 0-0.6x overhead for typical workloads. The outlier is mem_classe
 
 RESUME gets specialized to RESUME_CHECK after the first call to a function (`_QUICKEN_RESUME`). Initial implementation only hooked RESUME, so only the first invocation of each function was traced. This produced artificially low overhead (~1.0x) because most calls were silently untraced. Fix: added `_WAL_RESUME` to RESUME_CHECK, RESUME_CHECK_JIT, and INSTRUMENTED_RESUME macro compositions. After fix, all Python function calls are correctly traced.
 
-### Correctness: 124/124 conformance tests pass
+### Correctness: 124/124 conformance tests, 42/42 differential tests
 
 Test suite in `exp28_fork_tracewal/tests/test_wal_conformance.py` covers:
 
@@ -1880,6 +1880,8 @@ Test suite in `exp28_fork_tracewal/tests/test_wal_conformance.py` covers:
 | Generators (basic, pipeline, send) | 3 |
 | Global/nonlocal/closure (global vars, nonlocal, returned closure, shared cell) | 4 |
 | Post-mutation snapshots (list sort/reverse, set pop, deque reverse/rotate, list pop no-snapshot) | 7 |
+
+Additionally, a **27-test differential suite** (`test_differential.py`) validates WAL reconstruction against settrace ground truth. For each test program, it runs the function with pure Python settrace (capturing all variable values at every return), then with the fork WAL (mode 1), then replays the WAL and compares variable and object state at every function return point. Tests cover: simple assignment, reassignment, list/dict/set/deque operations, nested containers, branches, for/while/nested loops, nested calls, recursion, co-recursion, closures, closure callbacks, object mutations, class hierarchy, exceptions, exception-in-loop, nested exceptions, generators, generator pipeline, decorators, context managers with exceptions, heavy repeated mutations, and comprehensions.
 | Complex patterns (class hierarchy, context manager, decorator, comprehension, recursion, exception+mutation) | 6 |
 | LINE mode comparison (mode 0/1/2) | 3 |
 
@@ -1891,36 +1893,48 @@ Test suite in `exp28_fork_tracewal/tests/test_wal_conformance.py` covers:
 
 ### Performance: 23 workloads, 6 categories
 
-Apples-to-apples comparison with C extension in both stores-only and +LINE modes (10 rounds, 23 workloads):
+Final measurements with all WAL features (initial container snapshots, pre-computed offset→line tables, disk persistence via `/dev/null` flush). 31 workloads across 7 categories, 10 rounds:
 
-| Category | C noop | C ext (stores) | C ext (+LINE) | Fork mode 0 | Fork mode 1 |
-|---|---|---|---|---|---|
-| Compute (4) | 1.5x | 4.5x | 4.7x | 1.2x | 1.6x |
-| IO (3) | 1.3x | 1.6x | 1.6x | 1.2x | 1.3x |
-| Memory (4) | 1.4x | 3.8x | 3.9x | 1.2x | 1.7x |
-| Yield (2) | 2.4x | 6.6x | 6.4x | 2.2x | 3.9x |
-| Async (2) | 0.7x | 0.7x | 0.6x | 0.5x | 0.6x |
-| Pattern (8) | 1.7x | 4.6x | 4.7x | 1.5x | 1.8x |
-| **ALL (23)** | **1.6x** | **~3.9x** | **~3.9x** | **~1.3x** | **~1.8x** |
+| Category | C noop | C ext WAL | Fork mode 0 | Fork mode 1 |
+|---|---|---|---|---|
+| Compute (4) | 1.5x | 4.9x | 1.2x | 3.0x |
+| IO (3) | 1.3x | 1.6x | 1.2x | 1.3x |
+| Memory (4) | 1.5x | 4.0x | 1.2x | 2.2x |
+| Yield (2) | 2.5x | 7.7x | 2.5x | 4.2x |
+| Async (2) | 0.7x | 0.7x | 0.6x | 0.7x |
+| Pattern (8) | 1.7x | 5.8x | 1.5x | 2.3x |
+| Stress (8) | 1.5x | 3.4x | 1.3x | 2.0x |
+| **ALL (31)** | **1.5x** | **~4.2x** | **~1.4x** | **~2.2x** |
 
-Fork mode 2 (per-instruction LINE via `PyCode_Addr2Line` in DISPATCH) is ~21x. This is *worse* than the C extension's ~4x because the fork polls `PyCode_Addr2Line` on every bytecode instruction (many per source line), while settrace only fires once per source line change. Not a useful operating point without line table caching.
+Note: C ext stores-only (skipping LINE emission) is ~4.0x — almost identical to +LINE (4.2x), confirming the bottleneck is settrace dispatch, not WAL writes.
 
 ### Analysis
 
-**Fork mode 0 at 1.3x is the headline result.** Full variable state capture, mutation tracking, exceptions, closures, and call/return at overhead *below the settrace noop floor* (1.6x). This proves the WAL logic itself is genuinely cheap — the fork's overhead comes from `get_current_line()` calls at each hook, not from WAL buffer writes or OID lookups.
+**Fork mode 0 at 1.4x is below the settrace noop floor (1.5x).** Full variable state capture, mutation tracking, exceptions, closures, and call/return. The WAL logic itself is genuinely cheap.
 
-**Fork mode 1 at 1.8x adds only +0.5x for full control flow.** Branch destinations, loop iterations, exception jumps — enough for a replayer to reconstruct which lines executed. This is the recommended mode for debugger-style reconstruction.
+**Fork mode 1 at 2.2x is about half the C extension's 4.2x.** Branch destinations, loop iterations, exception jumps — enough for a replayer to reconstruct which lines executed. This is the recommended mode for debugger-style reconstruction.
 
-**Skipping LINE emission saves nothing for the C extension** (3.9x → 3.9x). The bottleneck is structural: settrace callback dispatch + `PyFrame_GetVar` on every LINE event. Even when the C extension doesn't emit WAL_LINE entries, it still receives and processes every LINE callback, reads variables via `PyFrame_GetVar`, and does frame cache lookups. The WAL entry write itself is negligible.
+**Pre-computed offset→line tables eliminated the main bottleneck.** Profiling with `perf` showed `PyCode_Addr2Line` was 78% of traced execution time before this optimization. Building an `offset→line` array per code object at registration time reduced mode 1 from 3.2x to 2.2x.
 
-**The C extension's 3.9x stores-only overhead is 3.0x above the fork's 1.3x.** This gap is entirely attributable to:
-1. Settrace dispatch overhead (~50-100ns/event) — every LINE event fires the callback even when no WAL entry is emitted
-2. `PyFrame_GetVar` O(n) name lookup (~100ns/read) — vs `localsplus[i]` (~1ns)
-3. `PyFrameObject` materialization — settrace forces lazy frame object creation
-4. `PyFrame_GetCode` INCREF/DECREF — vs `_PyFrame_GetCode` borrowed ref
+**Skipping LINE emission saves nothing for the C extension** (~4.0x → ~4.2x). The bottleneck is settrace dispatch + `PyFrame_GetVar`, not WAL writes.
 
-**Why fork mode 2 is slower than the C extension's full LINE tracking:** The DISPATCH macro fires on every bytecode instruction (~10-50 per source line). Each call to `_PyWAL_CheckLine` invokes `PyCode_Addr2Line` which walks the line table. Even though the result is deduplicated (same line → skip), the per-instruction overhead from the function call + line table decode dwarfs the settrace approach where CPython's own instrumentation machinery handles line deduplication internally and only fires the callback on actual line changes.
+**Benchmark methodology:** All measurements use `output_file='/dev/null'` to flush the 64MB WAL buffer when full, preventing silent entry dropping from buffer overflow. Earlier measurements without disk flush produced artificially low numbers for high-event workloads where the buffer filled during warmup and subsequent rounds ran with `wal_reserve` returning NULL (hooks still fire but skip WAL writes).
 
-### Performance benchmark suite
+### Test suites
 
-`exp28_fork_tracewal/tests/bench_performance.py` — 23 workloads across 6 categories (compute, IO, memory, yield, async, pattern). Reusable harness with CLI flags: `--quick`, `--fork-only`, `--rounds=N`, `--warmup=N`. Workloads defined in `workloads_large.py`.
+| Suite | File | Tests | Purpose |
+|---|---|---|---|
+| Conformance | `tests/test_wal_conformance.py` | 124 | Validates all WAL event types are correctly captured |
+| Differential | `tests/test_differential.py` | 42 | Validates WAL reconstruction matches settrace ground truth |
+| Performance | `tests/bench_performance.py` | 31 workloads | Measures overhead with disk flush across 7 categories |
+
+The differential suite uses `tests/reference_tracer.py` (pure Python settrace capturing full state at every step) and `tests/wal_replayer.py` (reconstructs state from WAL events). At every function return, it compares all local variable values and the return value between the settrace ground truth and the WAL reconstruction.
+
+Key fixes found during differential testing and performance profiling:
+- **Oid invalidation on return was too aggressive.** Invalidating all local oids on RETURN caused the return value to get a new oid, breaking reconstruction. Fix: removed scope-based oid invalidation; rely on type_tag mismatch detection for id() reuse instead.
+- **Tuple id reuse.** CPython reuses tuple addresses (e.g., `*a` args tuple in `__exit__` freed, then return tuple allocated at same address). Since tuples are immutable, same oid + same type_tag doesn't mean same object. Fix: always create a new oid for tuples.
+- **Initial container snapshots needed.** Lists, dicts, sets, and tuples created from literals (`[1,2,3]`, `{'a':1}`) had no WAL record of their initial contents. Fix: emit SNAPSHOT immediately after CREATE for non-empty containers, with pre-creation of oids for nested objects.
+- **Dict snapshot had a pos reset bug.** `PyDict_Next` position variable wasn't reset between the oid pre-creation pass and the value-writing pass, causing zero values to be written but the header claiming the full count. Fix: reset `pos = 0` before the second loop.
+- **Dict snapshot buffer reservation was too small.** String keys/values need up to 65 bytes each, but the reservation assumed 28 bytes per pair. Fix: increased to 140 bytes per pair.
+- **`PyCode_Addr2Line` was 78% of overhead.** Profiled with `perf record --call-graph dwarf`. Fix: pre-compute offset→line lookup table per code object. Reduced mode 1 from 3.2x to 2.2x.
+- **Benchmark buffer overflow artifact.** High-event workloads filled the 64MB buffer during warmup, causing measurement rounds to run with `wal_reserve` returning NULL. Fix: use `output_file='/dev/null'` to flush buffer when full.

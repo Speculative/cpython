@@ -84,7 +84,7 @@ Both backends skip OID creation for primitives (int, float, str, bool, None) and
 
 ## WAL Replay / State Reconstruction
 
-**Current state:** Experiment 25 has a basic Python replayer that can reconstruct list/dict/object state from WAL entries. Not integrated with the C extension or fork WAL formats. The fork's 124-test conformance suite validates that the event model captures enough information for full reconstruction.
+**Current state:** A WAL replayer (`exp28_fork_tracewal/tests/wal_replayer.py`) can reconstruct full variable and object state from WAL events. Validated by a 42-test differential suite that compares reconstruction against settrace ground truth at every function return — all 42 tests pass, covering recursion, co-recursion, closures, generators, exceptions, nested containers, decorators, context managers, match/case, for/else, try/finally, walrus operator, star unpacking, method chains, and more. The replayer handles lists, dicts, sets, tuples, user objects, nested containers, oid references between objects, initial container snapshots, post-mutation snapshots (sort/reverse/pop), and mutation replay (append/insert/extend/update/pop/setdefault).
 
 **WAL event model (validated by conformance tests):**
 - CREATE(oid, type) — object born
@@ -99,18 +99,23 @@ Both backends skip OID creation for primitives (int, float, str, bool, None) and
 
 **Object references:** Values in WAL entries are either inline primitives (int, float, str, bool, None — tag 0-4) or OID references (tag 5, `{ref: oid}`). This means object graphs are fully representable — a list containing a dict would have SETITEM entries where the value is `{ref: dict_oid}`.
 
-**Needed:**
-- Both backends' `get_wal()` return Python dicts — replayer consumes these
-- Full replay engine: given a WAL and a sequence number, reconstruct all object states at that point
-- Time-travel: efficiently seek to any WAL position
-- Handle SNAPSHOT events: replace reconstructed state with snapshot contents
-- UI/viewer integration
+**What works:**
+- Both backends' `get_wal()` returns Python dicts — replayer consumes these
+- Full replay: walk WAL sequentially, maintain object state, snapshot locals at any point
+- SNAPSHOT events correctly replace reconstructed state (for sort/reverse/pop/initial contents)
+- Oid references between objects are resolved during snapshot generation
+
+**Remaining work:**
+- Time-travel: efficiently seek to any WAL position (currently must replay from start)
+- Index/checkpoint system for fast seeks into large WALs
+- UI/viewer integration — step-through debugger frontend consuming replayer output
+- Disk WAL format reader (currently only reads in-memory buffer via `get_wal()`)
 
 ## ~~CPython Fork Investigation~~ DONE
 
 Implemented in Experiment 28. The fork modifies `Python/bytecodes.c` to add `if (_PyWAL_enabled) { _PyWAL_On*(); }` hooks to 18 bytecode handlers. WAL library in `Python/tracewal.c` (~1000 lines), Python module in `Modules/_tracewalmodule.c`.
 
-**Measured overhead: ~1.3x** (mode 0, stores + calls), **~1.8x** (mode 1, + control flow). 23 workloads, vs predicted 1.5-2.5x. Full details in EXPERIMENTS.md Experiment 28.
+**Measured overhead: ~1.4x** (mode 0, stores + calls), **~2.2x** (mode 1, + control flow). 31 workloads with disk persistence, vs predicted 1.5-2.5x. Full details in EXPERIMENTS.md Experiment 28.
 
 Key findings vs pre-investigation predictions:
 - `localsplus[i]` direct access confirmed ~1ns vs ~100ns for PyFrame_GetVar — biggest win.
@@ -170,25 +175,24 @@ Current overhead (23 workloads, 10 rounds, apples-to-apples):
 
 | Config | LINE tracking | Overall | Description |
 |---|---|---|---|
-| C noop (settrace floor) | — | 1.6x | Just receiving settrace callbacks, no WAL |
-| C ext WAL (stores only) | none | 3.9x | WAL capture via settrace, skip LINE emission |
-| C ext WAL (+LINE) | every line | 3.9x | WAL + LINE events (original mode) |
-| Fork mode 0 | none | **1.3x** | Stores + calls + mutations + exceptions |
-| Fork mode 1 | control flow | **1.8x** | + branches, loops, jumps |
-| Fork mode 2 | every line | ~21x | Per-instruction `PyCode_Addr2Line` — needs caching |
+| C noop (settrace floor) | — | 1.5x | Just receiving settrace callbacks, no WAL |
+| C ext WAL | every line | **4.2x** | WAL capture via settrace + disk persistence |
+| Fork mode 0 | none | **1.4x** | Stores + calls + mutations + exceptions + initial snapshots |
+| Fork mode 1 | control flow | **2.2x** | + branches, loops, jumps. Reconstruction validated by 42 differential tests. |
 
-Note: skipping LINE emission in the C extension saves essentially nothing (3.9x either way) — the bottleneck is settrace dispatch + PyFrame_GetVar, not WAL writes. Fork mode 2 is worse than the C extension because it polls `PyCode_Addr2Line` per instruction instead of per line change.
+Note: skipping LINE emission in the C extension saves ~0.2x (4.0x → 4.2x). The bottleneck is settrace dispatch + PyFrame_GetVar. All measurements use `/dev/null` disk flush to prevent buffer overflow artifacts.
 
 Completed optimizations:
 1. ~~Compact WAL format~~ **DONE** — reduced from 7.7x to 3.7x (C extension)
-2. ~~Direct `localsplus` access~~ **DONE** — fork mode 0 at 1.3x (vs C ext 3.8x)
-3. ~~Control-flow-only LINE tracking~~ **DONE** — fork mode 1 at 1.8x with full branch reconstruction
+2. ~~Direct `localsplus` access~~ **DONE** — fork mode 0 at 1.4x (vs C ext 4.2x)
+3. ~~Control-flow-only LINE tracking~~ **DONE** — fork mode 1 at 2.2x with full branch reconstruction
+7. ~~Pre-computed offset→line tables~~ **DONE** — eliminated `PyCode_Addr2Line` from hot path (was 78% of overhead), reduced mode 1 from 3.2x to 2.2x
 4. ~~Exception tracing~~ **DONE** — RAISE with origin line, EXCEPT for handler entry
 5. ~~Global/nonlocal/closure variables~~ **DONE** — STORE_GLOBAL, STORE_DEREF hooks
 6. ~~Post-mutation snapshots~~ **DONE** — SNAPSHOT after opaque C mutations (list sort/reverse, set pop, deque reverse/rotate). Reconstructable mutations (list/dict/deque pop, etc.) correctly excluded.
 
 Key optimizations not yet implemented:
-1. **`PyCode_Addr2Line` caching / per-line dispatch hook** — fork mode 2 is ~21x (worse than the C extension's ~4x) because `_PyWAL_CheckLine` in the DISPATCH macro calls `PyCode_Addr2Line` on every bytecode instruction. Since there are ~10-50 instructions per source line, this is 10-50x more calls than settrace's line-change callbacks. Two fix options: (a) pre-build an offset→line lookup table per code object so the check is a single array dereference, or (b) hook `INSTRUMENTED_LINE` (which CPython already fires once per line change) instead of DISPATCH, getting the same granularity as settrace without the callback overhead.
-2. **Selective function tracing** — currently the fork traces ALL Python function calls including stdlib internals. Adding a filter (e.g., only trace user code, or code registered by the analyzer) would reduce overhead for workloads that call many stdlib functions.
-3. **C extension: propose upstream API patches** — a "fast locals enumeration" API returning `(index, PyObject*)` pairs without name lookup would be the biggest C extension win
-4. **Larger buffer or adaptive flush threshold** — reduce flush frequency for event-dense workloads
+1. **Selective function tracing** — currently the fork traces ALL Python function calls including stdlib internals. Adding a filter (e.g., only trace user code, or code registered by the analyzer) would reduce overhead for workloads that call many stdlib functions.
+2. **C extension: propose upstream API patches** — a "fast locals enumeration" API returning `(index, PyObject*)` pairs without name lookup would be the biggest C extension win
+3. **Larger buffer or adaptive flush threshold** — reduce flush frequency for event-dense workloads
+4. **Mode 2 optimization** — the DISPATCH-level `_WAL_LINE_CHECK` now uses the pre-computed offset→line table, but still fires on every instruction. Could hook `INSTRUMENTED_LINE` instead (fires once per line change) for the same granularity at lower cost.

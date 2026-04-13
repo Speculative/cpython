@@ -32,7 +32,7 @@ from workloads_large import LARGE_WORKLOADS, QUICK_WORKLOADS
 # Measurement
 # ---------------------------------------------------------------------------
 
-def measure(workload_fn, n_warmup=3, n_rounds=10, iters_per_round=None):
+def measure(workload_fn, n_warmup=3, n_rounds=7, iters_per_round=None):
     """Measure median execution time of workload_fn in nanoseconds.
 
     Auto-calibrates iters_per_round to target ~50ms per round.
@@ -70,6 +70,7 @@ CATEGORIES = {
     'yield_': 'yield',
     'async_': 'async',
     'pat_': 'pattern',
+    'stress_': 'stress',
 }
 
 def categorize(name):
@@ -83,14 +84,34 @@ def categorize(name):
 # Tracing configurations
 # ---------------------------------------------------------------------------
 
-def build_configs(fork_only=False):
-    """Build list of (key, label, setup_fn, teardown_fn) tuples."""
+def build_configs(cext=False, stores=False):
+    """Build list of (key, label, setup_fn, teardown_fn) tuples.
+
+    Default: baseline + fork mode 1 only (the blessed capture path).
+    --cext: add C extension WAL (+LINE) and settrace noop for comparison.
+    --stores: add store-only modes (fork m0, C ext stores) for analysis.
+    """
+    import _tracewal
+
+    # Use /dev/null as output to flush the buffer when full (realistic behavior)
+    # without actual disk I/O cost. This prevents buffer overflow from silently
+    # dropping events and skewing measurements.
+    _wal_output = '/dev/null'
+
     configs = [
         ('baseline', 'Baseline', lambda: None, lambda: None),
     ]
 
-    if not fork_only:
-        # C extension settrace noop
+    if stores:
+        configs.append(('fork_m0', 'Fork stores',
+                        lambda: _tracewal.start(line_mode=0, output_file=_wal_output),
+                        lambda: _tracewal.stop()))
+
+    configs.append(('fork_m1', 'Fork ctrl',
+                    lambda: _tracewal.start(line_mode=1, output_file=_wal_output),
+                    lambda: _tracewal.stop()))
+
+    if cext:
         try:
             import _ctrace
             configs.append(('c_noop', 'C noop',
@@ -98,23 +119,18 @@ def build_configs(fork_only=False):
         except ImportError:
             pass
 
-        # C extension WAL — both modes
         try:
             import _ctrace_wal
             _setup_cext_registration()
-            configs.append(('cext_stores', 'C ext stores',
-                            lambda: _ctrace_wal.start(line_mode=0), lambda: _ctrace_wal.stop()))
-            configs.append(('cext_lines', 'C ext +LINE',
-                            lambda: _ctrace_wal.start(line_mode=1), lambda: _ctrace_wal.stop()))
+            if stores:
+                configs.append(('cext_stores', 'C ext stores',
+                                lambda: _ctrace_wal.start(line_mode=0, output_file=_wal_output),
+                                lambda: _ctrace_wal.stop()))
+            configs.append(('cext_lines', 'C ext WAL',
+                            lambda: _ctrace_wal.start(line_mode=1, output_file=_wal_output),
+                            lambda: _ctrace_wal.stop()))
         except ImportError:
             pass
-
-    # Fork WAL modes
-    import _tracewal
-    configs.append(('fork_m0', 'Fork stores',
-                    lambda: _tracewal.start(line_mode=0), lambda: _tracewal.stop()))
-    configs.append(('fork_m1', 'Fork ctrl',
-                    lambda: _tracewal.start(line_mode=1), lambda: _tracewal.stop()))
 
     return configs
 
@@ -221,7 +237,7 @@ def print_results(workload_names, configs, results):
     print(header)
     print("-" * len(header))
 
-    for cat in ['compute', 'io', 'memory', 'yield', 'async', 'pattern']:
+    for cat in ['compute', 'io', 'memory', 'yield', 'async', 'pattern', 'stress']:
         names = cat_wl.get(cat, [])
         if not names:
             continue
@@ -271,10 +287,10 @@ def run_benchmark(workloads=None, configs=None, n_warmup=3, n_rounds=10):
     workload_names = list(workloads.keys())
     results = {k: {} for k, _, _, _ in configs}
 
-    for cfg_key, cfg_label, setup, teardown in configs:
-        print(f"  Running {cfg_label}...")
-        for name in workload_names:
-            fn = workloads[name]
+    # Interleave configs per workload so each workload gets equal warmth
+    for name in workload_names:
+        fn = workloads[name]
+        for cfg_key, cfg_label, setup, teardown in configs:
             setup()
             med = measure(fn, n_warmup=n_warmup, n_rounds=n_rounds)
             teardown()
@@ -287,16 +303,18 @@ def main():
     parser = argparse.ArgumentParser(description='WAL Tracing Performance Benchmark')
     parser.add_argument('--quick', action='store_true',
                         help='Use quick workload subset')
-    parser.add_argument('--fork-only', action='store_true',
-                        help='Only benchmark fork WAL modes')
-    parser.add_argument('--rounds', type=int, default=10,
-                        help='Number of measurement rounds (default: 10)')
+    parser.add_argument('--cext', action='store_true',
+                        help='Include C extension WAL for comparison')
+    parser.add_argument('--stores', action='store_true',
+                        help='Include store-only modes (fork m0, C ext stores)')
+    parser.add_argument('--rounds', type=int, default=7,
+                        help='Number of measurement rounds (default: 7)')
     parser.add_argument('--warmup', type=int, default=3,
                         help='Number of warmup rounds (default: 3)')
     args = parser.parse_args()
 
     workloads = QUICK_WORKLOADS if args.quick else LARGE_WORKLOADS
-    configs = build_configs(fork_only=args.fork_only)
+    configs = build_configs(cext=args.cext, stores=args.stores)
 
     print("WAL Tracing Performance Benchmark")
     print(f"Python: {sys.version}")
@@ -309,29 +327,30 @@ def main():
     workload_names = list(workloads.keys())
     print_results(workload_names, configs, results)
 
-    # WAL stats for each fork mode
+    # WAL stats
     import _tracewal
-    for mode, label in [(0, 'Fork stores (mode 0)'),
-                        (1, 'Fork ctrl (mode 1)'),
-                        (2, 'Fork full (mode 2)')]:
+    modes_to_stat = [(1, 'Fork ctrl (mode 1)')]
+    if args.stores:
+        modes_to_stat.insert(0, (0, 'Fork stores (mode 0)'))
+    for mode, label in modes_to_stat:
         _tracewal.clear()
-        _tracewal.start(line_mode=mode)
+        _tracewal.start(line_mode=mode, output_file='/dev/null')
         for name in workload_names:
             workloads[name]()
         _tracewal.stop()
         print_wal_stats(label, _tracewal.stats())
 
-    # C extension stats if available
-    try:
-        import _ctrace_wal
-        _setup_cext_registration()
-        _ctrace_wal.start()
-        for name in workload_names:
-            workloads[name]()
-        _ctrace_wal.stop()
-        print_wal_stats('C ext WAL', _ctrace_wal.stats())
-    except ImportError:
-        pass
+    if args.cext:
+        try:
+            import _ctrace_wal
+            _setup_cext_registration()
+            _ctrace_wal.start(output_file='/dev/null')
+            for name in workload_names:
+                workloads[name]()
+            _ctrace_wal.stop()
+            print_wal_stats('C ext WAL', _ctrace_wal.stats())
+        except ImportError:
+            pass
 
 
 if __name__ == '__main__':

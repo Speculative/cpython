@@ -45,6 +45,26 @@
 typedef uint32_t oid_t;
 #define OID_NONE 0
 
+/* WAL event types */
+typedef enum {
+    WAL_CREATE = 1,
+    WAL_BIND,
+    WAL_UNBIND,
+    WAL_MUTATE,
+    WAL_SETATTR,
+    WAL_SETITEM,
+    WAL_DELITEM,
+    WAL_DELATTR,
+    WAL_DEALLOC,
+    WAL_LINE,
+    WAL_CALL,
+    WAL_RETURN,
+    WAL_EXCEPTION,
+    WAL_RAISE,
+    WAL_EXCEPT,
+    WAL_SNAPSHOT,
+} WALEventType;
+
 /* Global enable flag */
 int _PyWAL_enabled = 0;
 int _PyWAL_line_mode = 1;  /* default: full LINE tracking */
@@ -124,8 +144,9 @@ static void oid_invalidate(uintptr_t cid) {
     }
 }
 
-/* Forward declaration */
+/* Forward declarations */
 static void wal_emit_create(oid_t oid, uint8_t type_tag, int32_t line);
+static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag, PyObject *obj, int32_t line);
 
 static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
     uintptr_t cid = (uintptr_t)obj;
@@ -137,6 +158,14 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
         if (!e->occupied) break;
         if (e->cpython_id == cid) {
             if (e->type_tag == type_tag) {
+                /* For immutable types (tuples, frozensets), id reuse is
+                 * indistinguishable from same object — but since we removed
+                 * oid invalidation on return, a freed tuple's id can be reused
+                 * by a new tuple with different contents. Force a new oid. */
+                if (type_tag == 4 /* tuple */) {
+                    e->occupied = 0;
+                    break;
+                }
                 return e->oid;
             }
             e->occupied = 0;
@@ -146,6 +175,7 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
 
     oid_t oid = oid_create(cid, type_tag);
     wal_emit_create(oid, type_tag, line);
+    wal_emit_initial_snapshot(oid, type_tag, obj, line);
     return oid;
 }
 
@@ -165,24 +195,7 @@ static uint64_t g_stat_mutations = 0;
  * Compact WAL byte-stream buffer (identical format to ctrace_wal_compact.c)
  * ======================================================================== */
 
-typedef enum {
-    WAL_CREATE = 1,
-    WAL_BIND,
-    WAL_UNBIND,
-    WAL_MUTATE,
-    WAL_SETATTR,
-    WAL_SETITEM,
-    WAL_DELITEM,
-    WAL_DELATTR,
-    WAL_DEALLOC,
-    WAL_LINE,
-    WAL_CALL,
-    WAL_RETURN,
-    WAL_EXCEPTION,
-    WAL_RAISE,       /* explicit raise — has exc type string */
-    WAL_EXCEPT,      /* exception caught by except handler */
-    WAL_SNAPSHOT,    /* full object snapshot after opaque C mutation (sort, reverse) */
-} WALEventType;
+/* WALEventType defined above in forward declarations */
 
 #define WAL_BUF_DEFAULT (64 * 1024 * 1024)  /* 64 MB */
 #define WAL_MAX_ENTRY_SIZE 300
@@ -301,6 +314,97 @@ static void wal_emit_create(oid_t oid, uint8_t type_tag, int32_t line) {
     wal_finish(p);
 }
 
+static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
+                                       PyObject *obj, int32_t line) {
+    /* Emit SNAPSHOT for non-empty containers at creation time so the replayer
+     * knows initial contents (e.g., [1,2,3] from BUILD_LIST). */
+    if (type_tag == 1 /* list */ && PyList_GET_SIZE(obj) > 0) {
+        Py_ssize_t n = PyList_GET_SIZE(obj);
+        if (n > 256) n = 256;
+        /* Pre-create oids for non-primitive elements so wal_write_value
+         * finds them via oid_lookup (avoids nested wal_reserve). */
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *item = PyList_GET_ITEM(obj, i);
+            if (item && !is_primitive(item)) {
+                oid_get_or_create(item, line);
+            }
+        }
+        uint8_t *p = wal_reserve(15 + 2 + n * 14);
+        if (p) {
+            wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
+            wal_write_u16(&p, (uint16_t)n);
+            for (Py_ssize_t i = 0; i < n; i++) {
+                wal_write_value(&p, PyList_GET_ITEM(obj, i), line);
+            }
+            wal_finish(p);
+        }
+    } else if (type_tag == 2 /* dict */ && PyDict_GET_SIZE(obj) > 0) {
+        PyObject *key, *val;
+        Py_ssize_t pos = 0;
+        Py_ssize_t pairs = PyDict_GET_SIZE(obj);
+        if (pairs > 256) pairs = 256;
+        /* Pre-create oids for non-primitive keys and values */
+        pos = 0;
+        while (PyDict_Next(obj, &pos, &key, &val)) {
+            if (key && !is_primitive(key)) oid_get_or_create(key, line);
+            if (val && !is_primitive(val)) oid_get_or_create(val, line);
+        }
+        /* Each key-value pair can be up to 2*65 bytes (two strings) + 2 tags */
+        uint8_t *p = wal_reserve(15 + 2 + pairs * 140);
+        if (p) {
+            wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
+            wal_write_u16(&p, (uint16_t)(pairs * 2));
+            Py_ssize_t n = 0;
+            pos = 0;
+            while (PyDict_Next(obj, &pos, &key, &val) && n < pairs) {
+                wal_write_value(&p, key, line);
+                wal_write_value(&p, val, line);
+                n++;
+            }
+            wal_finish(p);
+        }
+    } else if (type_tag == 3 /* set */ && PySet_GET_SIZE(obj) > 0) {
+        PyObject *iter = PyObject_GetIter(obj);
+        if (iter) {
+            PyObject *items[256];
+            Py_ssize_t n = 0;
+            PyObject *item;
+            while (n < 256 && (item = PyIter_Next(iter)) != NULL) {
+                items[n++] = item;
+            }
+            Py_DECREF(iter);
+            uint8_t *p = wal_reserve(15 + 2 + n * 14);
+            if (p) {
+                wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
+                wal_write_u16(&p, (uint16_t)n);
+                for (Py_ssize_t i = 0; i < n; i++) {
+                    wal_write_value(&p, items[i], line);
+                    Py_DECREF(items[i]);
+                }
+                wal_finish(p);
+            } else {
+                for (Py_ssize_t i = 0; i < n; i++) Py_DECREF(items[i]);
+            }
+        }
+    } else if (type_tag == 4 /* tuple */ && PyTuple_GET_SIZE(obj) > 0) {
+        Py_ssize_t n = PyTuple_GET_SIZE(obj);
+        if (n > 256) n = 256;
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *item = PyTuple_GET_ITEM(obj, i);
+            if (item && !is_primitive(item)) oid_get_or_create(item, line);
+        }
+        uint8_t *p = wal_reserve(15 + 2 + n * 14);
+        if (p) {
+            wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
+            wal_write_u16(&p, (uint16_t)n);
+            for (Py_ssize_t i = 0; i < n; i++) {
+                wal_write_value(&p, PyTuple_GET_ITEM(obj, i), line);
+            }
+            wal_finish(p);
+        }
+    }
+}
+
 /* ========================================================================
  * Code analysis cache (simplified — no bytecode mutation info needed)
  * ======================================================================== */
@@ -310,6 +414,8 @@ typedef struct {
     int n_locals;
     int n_args;           /* co_argcount + co_kwonlyargcount + varargs/varkeywords */
     uint16_t code_idx;
+    int32_t *offset_to_line;  /* pre-computed offset→line table, NULL if not built */
+    int n_offsets;             /* size of offset_to_line array */
 } CodeAnalysis;
 
 static CodeAnalysis g_code_cache[MAX_CODE_ENTRIES];
@@ -343,6 +449,30 @@ static int code_hash_insert(PyObject *code, int cache_idx) {
     return -1;
 }
 
+/* Build a pre-computed offset→line lookup table for a code object.
+ * This replaces per-call PyCode_Addr2Line (~78% of traced overhead). */
+static void build_offset_to_line(CodeAnalysis *ca, PyCodeObject *code) {
+    Py_ssize_t code_len = Py_SIZE(code);
+    if (code_len <= 0 || code_len > 100000) {
+        ca->offset_to_line = NULL;
+        ca->n_offsets = 0;
+        return;
+    }
+
+    ca->n_offsets = (int)code_len;
+    ca->offset_to_line = (int32_t *)PyMem_Calloc(code_len, sizeof(int32_t));
+    if (!ca->offset_to_line) {
+        ca->n_offsets = 0;
+        return;
+    }
+
+    /* Walk the line table once and fill in all offsets */
+    for (int i = 0; i < code_len; i++) {
+        ca->offset_to_line[i] = (int32_t)PyCode_Addr2Line(
+            code, i * (int)sizeof(_Py_CODEUNIT));
+    }
+}
+
 /* Auto-register a code object on first encounter */
 static int code_auto_register(PyCodeObject *code) {
     if (g_n_codes >= MAX_CODE_ENTRIES) return -1;
@@ -359,6 +489,9 @@ static int code_auto_register(PyCodeObject *code) {
     if (n_args > ca->n_locals) n_args = ca->n_locals;
     ca->n_args = n_args;
     ca->code_idx = (uint16_t)cache_idx;
+
+    /* Build offset→line lookup table */
+    build_offset_to_line(ca, code);
 
     code_hash_insert((PyObject *)code, cache_idx);
     return cache_idx;
@@ -412,13 +545,35 @@ static void pop_frame(_PyInterpreterFrame *frame) {
 }
 
 /* ========================================================================
- * Line number helper
+ * Line number helper — cached to avoid repeated PyCode_Addr2Line calls
+ *
+ * PyCode_Addr2Line walks the line table on every call (~78% of traced
+ * execution time before caching). Since consecutive bytecodes in the
+ * same function are usually on the same source line, we cache the last
+ * result per frame and only re-query when the instruction offset changes.
  * ======================================================================== */
 
-static inline int32_t get_current_line(_PyInterpreterFrame *frame) {
+/* Fast line lookup using code_idx from FrameCache — avoids hash lookup */
+static inline int32_t get_line_fast(int code_idx, _PyInterpreterFrame *frame) {
+    if (code_idx >= 0 && code_idx < g_n_codes) {
+        CodeAnalysis *ca = &g_code_cache[code_idx];
+        if (ca->offset_to_line) {
+            int offset = (int)(frame->instr_ptr - _PyCode_CODE(_PyFrame_GetCode(frame)));
+            if (offset >= 0 && offset < ca->n_offsets) {
+                return ca->offset_to_line[offset];
+            }
+        }
+    }
+    /* Fallback */
     PyCodeObject *code = _PyFrame_GetCode(frame);
     int offset = (int)(frame->instr_ptr - _PyCode_CODE(code));
     return (int32_t)PyCode_Addr2Line(code, offset * (int)sizeof(_Py_CODEUNIT));
+}
+
+/* Slow path for when we don't have a code_idx */
+static inline int32_t get_current_line(_PyInterpreterFrame *frame) {
+    int code_idx = code_hash_lookup((PyObject *)_PyFrame_GetCode(frame));
+    return get_line_fast(code_idx, frame);
 }
 
 /* Fast per-dispatch line tracking.
@@ -430,16 +585,16 @@ static int32_t g_last_line_num = -1;
 void
 _PyWAL_CheckLine(_PyInterpreterFrame *frame)
 {
-    int32_t line = get_current_line(frame);
+    /* Get code_idx first so we can use the fast line lookup */
+    int code_idx = code_get_idx(frame);
+    if (code_idx < 0) return;
+
+    int32_t line = get_line_fast(code_idx, frame);
     if (line == g_last_line_num && frame == g_last_line_frame) return;
     if (line <= 0) return;
 
     g_last_line_num = line;
     g_last_line_frame = frame;
-
-    /* Find code_idx for this frame */
-    int code_idx = code_get_idx(frame);
-    if (code_idx < 0) return;
 
     uint8_t *p = wal_reserve(15);
     if (p) {
@@ -518,7 +673,7 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
         CodeAnalysis *ca = &g_code_cache[code_idx];
         FrameCache *fc = push_frame(frame, code_idx);
 
-        int32_t line = get_current_line(frame);
+        int32_t line = get_line_fast(code_idx, frame);
         fc->last_line = line;
 
         /* Emit CALL */
@@ -561,7 +716,7 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
         /* Generator resume — update frame's last_line */
         FrameCache *fc = find_frame(frame);
         if (fc) {
-            int32_t line = get_current_line(frame);
+            int32_t line = get_line_fast(fc->code_idx, frame);
         }
     }
 }
@@ -578,7 +733,7 @@ _PyWAL_OnStoreFast(_PyInterpreterFrame *frame, int local_idx,
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     PyObject *new_obj = PyStackRef_IsNull(new_val) ? NULL :
                         PyStackRef_AsPyObjectBorrow(new_val);
@@ -647,7 +802,7 @@ _PyWAL_OnStoreSubscr(_PyInterpreterFrame *frame,
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     /* Pre-create oids for complex values before starting WAL entry */
     if (!is_primitive(container)) {
@@ -683,7 +838,7 @@ _PyWAL_OnStoreAttr(_PyInterpreterFrame *frame,
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     /* Pre-create oids */
     if (!is_primitive(owner)) {
@@ -720,7 +875,7 @@ _PyWAL_OnDeleteSubscr(_PyInterpreterFrame *frame,
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     oid_t container_oid = OID_NONE;
     if (!is_primitive(container)) {
@@ -745,7 +900,7 @@ _PyWAL_OnDeleteAttr(_PyInterpreterFrame *frame,
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     oid_t owner_oid = OID_NONE;
     if (!is_primitive(owner)) {
@@ -772,7 +927,7 @@ _PyWAL_OnReturn(_PyInterpreterFrame *frame, PyObject *retval)
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
     int code_idx = fc->code_idx;
 
     /* Unbind all locals */
@@ -787,11 +942,10 @@ _PyWAL_OnReturn(_PyInterpreterFrame *frame, PyObject *retval)
                 wal_write_u16(&p, (uint16_t)i);
                 wal_finish(p);
             }
-            /* Scope-based oid invalidation */
-            _PyStackRef ref = frame->localsplus[i];
-            if (!PyStackRef_IsNull(ref)) {
-                oid_invalidate((uintptr_t)PyStackRef_AsPyObjectBorrow(ref));
-            }
+            /* Note: we do NOT invalidate oids here. The objects may still
+             * be alive (referenced by caller, return value, or globals).
+             * Oid invalidation for id() reuse is handled by type_tag
+             * mismatch detection in oid_get_or_create. */
         }
     }
 
@@ -821,7 +975,7 @@ _PyWAL_OnYield(_PyInterpreterFrame *frame, PyObject *retval)
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     /* Emit RETURN event for yield (frame stays alive, no unbind) */
     if (retval && !is_primitive(retval)) {
@@ -852,7 +1006,7 @@ _PyWAL_OnStoreGlobal(_PyInterpreterFrame *frame,
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     /* Globals are stored in a dict — we emit SETITEM on the globals dict.
      * But for debugger display, we use a BIND-like event with the
@@ -887,7 +1041,7 @@ _PyWAL_OnStoreDeref(_PyInterpreterFrame *frame,
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     /* cell_idx is the localsplus index of the cell.
      * The variable name is in co_localsplusnames[cell_idx]. */
@@ -1117,7 +1271,7 @@ _PyWAL_OnCall(_PyInterpreterFrame *frame,
     g_stat_events++;
     g_stat_mutations++;
 
-    int32_t line = get_current_line(frame);
+    int32_t line = get_line_fast(fc->code_idx, frame);
 
     /* Pre-create oids for all values */
     oid_t self_oid = oid_get_or_create(self_or_null, line);
@@ -1333,6 +1487,10 @@ void
 _PyWAL_Clear(void)
 {
     _PyWAL_enabled = 0;
+    for (int i = 0; i < g_n_codes; i++) {
+        PyMem_Free(g_code_cache[i].offset_to_line);
+        g_code_cache[i].offset_to_line = NULL;
+    }
     g_n_codes = 0;
     g_n_frames = 0;
     if (g_wal_buf) { PyMem_Free(g_wal_buf); g_wal_buf = NULL; }
