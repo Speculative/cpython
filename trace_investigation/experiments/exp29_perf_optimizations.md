@@ -93,7 +93,8 @@ script that genuinely needs >256K oids. With dealloc hooks deferred,
 real captures will accumulate millions of oids over minutes — only a
 resizable structure handles that gracefully.
 
-## 2. Pluggable user-code classifier  *(scheduled)*
+## 2. Pluggable user-code classifier  *(scoped, partial implementation
+backed out — needs loader-side rework)*
 
 **Idea.** The fork stays out of the "what is user code?" business —
 that's project-specific and varies by use case. It only provides the
@@ -188,6 +189,53 @@ enough for the demo.
 
 **Recommendation.** Start with the simple version. Bench. Only do the
 smart version if real captures still have too much mutation noise.
+
+### Implementation attempt — what we hit
+
+Tried this on top of the resizable-oid_map commit. Fork-side scaffolding
+(per-CodeAnalysis `is_traceable`/`classified` bits, `_tracewal.set_classifier`
+API, `code_is_traceable` lazy lookup, hook gates in OnResume / OnReturn /
+OnYield / OnStoreFast / CheckLine) all built and worked in isolation
+(smoke-tested with a classifier returning False — confirmed events were
+correctly suppressed, classifier was called once per unique code).
+
+But running our differential test suite revealed the design assumes more
+than the loader can handle:
+
+- **Loader frame-stack tracking depends on a complete CALL/RETURN
+  stream.** Today the loader pushes a frame on every CALL (with a `-1`
+  frame_id placeholder for stdlib codes that the load-time classifier
+  filters), and pops on every RETURN. Skipping stdlib CALL/RETURN at
+  capture time leaves the loader's internal stack unbalanced — a stdlib
+  function called from user code never gets pushed, but the user
+  frame's CALL/RETURN bracketing assumes it should be.
+- **Loader oid-bound tracking depends on UNBIND.** Per-frame `bound_oids`
+  is cleared on UNBIND, used for user-visibility reasoning. Without
+  stdlib UNBINDs, oids stay "bound" in stdlib forever from the loader's
+  POV.
+- **Differential test mismatch.** The settrace reference always sees
+  every event. Today the differential test compares loader vs reference
+  on a structural projection that's symmetric only because both go
+  through the loader's load-time classifier. Pre-filtering at capture
+  time means the loader's view is missing events the reference still
+  sees. Loader and reference diverge.
+
+So this isn't a 80-line change in the fork — it's also a meaningful
+loader rework: the loader needs to gracefully handle "this stdlib
+event was suppressed at capture time and you'll never see it,"
+maintaining frame-stack consistency without it. And the differential
+test infrastructure needs to apply the same classifier to the
+reference's settrace stream so the comparison stays apples-to-apples.
+
+Estimate now: ~80 LoC fork + ~150 LoC loader + ~50 LoC reference/
+test plumbing = several hours of careful work. Worth doing for the
+WAL-volume win, but not the quick-and-easy win we initially scoped.
+
+The scaffolding code from the attempt (struct fields, classifier API,
+hook-gate sites) was reverted. Picked up where we left off when we
+revisit, the big ticket items are (a) loader CALL/RETURN handling
+when frames go missing, and (b) reference tracer that mirrors the
+classifier so settrace's view matches.
 
 ## 3. tp_dealloc hooks  *(post-demo)*
 
@@ -304,11 +352,13 @@ we're touching the STORE_FAST hook for other reasons.
 
 **Pre-demo, in order:**
 
-1. **#1 (resizable oid_map)** — fixes a sharp cliff that already
-   makes some real workloads unusable.
-2. **#2 (pluggable user-code classifier)** — biggest WAL volume win,
-   and necessary infrastructure for the demo itself (so the captured
-   bundle is a clean slice of user code, not 99.7% stdlib).
+1. **#1 (resizable oid_map)** — done. Removes a sharp cliff. ~11%
+   aggregate runtime improvement in our benchmark (2.91x → 2.6x).
+2. **#2 (pluggable user-code classifier)** — scoped, attempted, backed
+   out (see "Implementation attempt" above). Bigger lift than
+   estimated because of loader-side coupling. Push to alongside
+   demo work or post-demo; the resize alone gives us a defensible
+   "tracing overhead" story for the demo.
 
 **Post-demo, prioritized:**
 
