@@ -20,7 +20,8 @@ should be re-checked when actually doing the work.
 | # | Optimization | Aggregate win | Code | Invasiveness | Crash risk | When |
 |---|---|---|---|---|---|---|
 | 1 | Resizable oid_map | Removes a sharp cliff | ~40 LoC | Hash table refactor | Low | **next** |
-| 2 | Pluggable user-code classifier | ~5-10x WAL volume | ~80 LoC | Per-code tag + Python callback hook + every event-emitting hook | Low-Medium | **after #1** |
+| 2a | Surgical classifier (BIND/UNBIND/LINE only, CALL/RETURN/mutations always emit) | ~5% TOTAL bench, up to ~40% on stdlib-heavy workloads | ~120 LoC fork + ~60 LoC bootstrap | Per-code tag + Python callback hook + 4 hook gates | Low | **landed** |
+| 2b | Complete classifier (also skip CALL/RETURN, plus oid-visibility-gated mutations) | ~5-10x WAL volume | adds ~150 LoC loader + ~50 LoC reference/test plumbing | Loader frame-stack rework + reference-tracer mirror filter | Medium | post-demo |
 | 3 | tp_dealloc hooks | ~2x runtime + bounds map memory | ~80-150 LoC | Patches CPython type slots | High | post-demo |
 | 4 | Compact event encoding | ~2-3x smaller WAL | ~100 LoC | Touches every emit + every parser | Medium | post-demo |
 | 5 | Streaming compression | ~3-5x smaller WAL | ~50 LoC | flush path + reader | Medium-Low | post-demo |
@@ -93,8 +94,63 @@ script that genuinely needs >256K oids. With dealloc hooks deferred,
 real captures will accumulate millions of oids over minutes — only a
 resizable structure handles that gracefully.
 
-## 2. Pluggable user-code classifier  *(scoped, partial implementation
-backed out — needs loader-side rework)*
+## 2. Pluggable user-code classifier  *(surgical version landed —
+full version still pending)*
+
+**Status (2026-04-26).** A **surgical** subset shipped: the fork skips
+BIND, UNBIND, LINE, and STORE_DEREF cell binds for non-traceable code,
+but still emits CALL, RETURN, all mutation events
+(SETATTR/SETITEM/MUTATE/DELITEM/DELATTR/STORE_GLOBAL), and
+CREATE/SNAPSHOT/OBJ_SNAPSHOT unconditionally. Because the loader was
+already dropping BIND/UNBIND/LINE for `frame.frame_id == -1` frames,
+this changes nothing in the loaded trace — it just avoids the WAL
+write and string-intern work for events the loader was going to throw
+away anyway. All 20 differential tests pass without any reference-
+tracer or loader changes.
+
+Bench (large workloads, line_mode=1, clear+start per iter, median of
+3 runs): TOTAL fork-vs-baseline drops from ~2.72x → ~2.62x (~4%
+overall improvement). Stdlib-heavy workloads improve much more —
+async_prodcons 1.76x → ~1.0x, io_json 2.38x → 1.7x, stress_oid_churn
+2.53x → 1.4x, async_network 1.98x → 1.6x. Pure-user-code workloads
+sit within noise; no consistent regression across runs.
+
+**What's still left for the full job (#2b).** The surgical version
+buys us cheap WAL skipping but doesn't buy back the larger gains on
+the table. Three deferred pieces, each requires loader work:
+
+1. **Skip CALL/RETURN for non-traceable code** — biggest WAL volume
+   win. The loader currently tracks a full nesting frame stack
+   (used for parent_frame_id wiring and RETURN unwinding); without
+   stdlib CALL/RETURN, that stack falls out of balance. Loader needs
+   to maintain frame-stack consistency from user-code-only events,
+   probably via "RETURN of a code_idx not currently on top of stack
+   means an unseen stdlib RETURN happened — pop until we match" logic
+   like the existing generator-RETURN handling.
+
+2. **Mirror the classifier in the settrace reference tracer** — once
+   we drop CALL/RETURN at capture time, the reference (which still
+   sees everything) and the loaded fork trace will diverge. The
+   reference tracer needs the same code-object classifier so its
+   captured events line up apples-to-apples.
+
+3. **Oid-visibility-gated mutations** — even with classifier, today's
+   surgical version emits SETITEM on a list that was created and lives
+   entirely inside stdlib (for example, json's internal scratch
+   buffers). The loader applies these to objects the user can never
+   see. Gating mutation emission on an `is_user_visible:1` bit on
+   `OidMapEntry` (set when the oid is bound in user code or appears
+   in a user-visible container's contents) eliminates that. More
+   correctness risk — propagation has edge cases (a user object
+   containing a stdlib-created list, etc.) — so gate this on
+   measurement: if surgical+full-skip already gets us to "tracing is
+   cheap" demo claims, defer indefinitely.
+
+The original design notes follow.
+
+---
+
+### Original design notes (pre-implementation)
 
 **Idea.** The fork stays out of the "what is user code?" business —
 that's project-specific and varies by use case. It only provides the
@@ -190,52 +246,51 @@ enough for the demo.
 **Recommendation.** Start with the simple version. Bench. Only do the
 smart version if real captures still have too much mutation noise.
 
-### Implementation attempt — what we hit
+### Implementation history
 
-Tried this on top of the resizable-oid_map commit. Fork-side scaffolding
-(per-CodeAnalysis `is_traceable`/`classified` bits, `_tracewal.set_classifier`
-API, `code_is_traceable` lazy lookup, hook gates in OnResume / OnReturn /
-OnYield / OnStoreFast / CheckLine) all built and worked in isolation
-(smoke-tested with a classifier returning False — confirmed events were
-correctly suppressed, classifier was called once per unique code).
-
-But running our differential test suite revealed the design assumes more
-than the loader can handle:
+A first attempt at the **full** version (skip CALL/RETURN/BIND/UNBIND/LINE
+in stdlib) was scoped at "~80 LoC in the fork." Built and worked in
+isolation, but broke the differential test suite — three loader
+assumptions don't hold once stdlib events are pre-filtered at capture
+time:
 
 - **Loader frame-stack tracking depends on a complete CALL/RETURN
-  stream.** Today the loader pushes a frame on every CALL (with a `-1`
-  frame_id placeholder for stdlib codes that the load-time classifier
-  filters), and pops on every RETURN. Skipping stdlib CALL/RETURN at
-  capture time leaves the loader's internal stack unbalanced — a stdlib
-  function called from user code never gets pushed, but the user
-  frame's CALL/RETURN bracketing assumes it should be.
-- **Loader oid-bound tracking depends on UNBIND.** Per-frame `bound_oids`
-  is cleared on UNBIND, used for user-visibility reasoning. Without
-  stdlib UNBINDs, oids stay "bound" in stdlib forever from the loader's
-  POV.
+  stream.** The loader pushes a frame on every CALL (with `frame_id =
+  -1` for stdlib codes), pops on every RETURN. Skipping stdlib
+  CALL/RETURN leaves its stack unbalanced — a stdlib function called
+  from user code never gets pushed, so the next user-code RETURN pops
+  the wrong frame.
+- **Loader oid-bound tracking depends on UNBIND.** Per-frame
+  `bound_oids` is cleared on UNBIND. Without stdlib UNBINDs, oids
+  stay "bound" in stdlib forever from the loader's POV.
 - **Differential test mismatch.** The settrace reference always sees
-  every event. Today the differential test compares loader vs reference
-  on a structural projection that's symmetric only because both go
-  through the loader's load-time classifier. Pre-filtering at capture
-  time means the loader's view is missing events the reference still
-  sees. Loader and reference diverge.
+  every event. Today's comparison stays symmetric only because both
+  sides go through the loader's load-time classifier. Pre-filtering
+  at capture time means the fork's view is missing events the
+  reference still has — the two diverge.
 
-So this isn't a 80-line change in the fork — it's also a meaningful
-loader rework: the loader needs to gracefully handle "this stdlib
-event was suppressed at capture time and you'll never see it,"
-maintaining frame-stack consistency without it. And the differential
-test infrastructure needs to apply the same classifier to the
-reference's settrace stream so the comparison stays apples-to-apples.
+So the full version is ~80 LoC fork + ~150 LoC loader + ~50 LoC
+reference/test plumbing. Several hours of careful work, not the
+quick win we initially scoped.
 
-Estimate now: ~80 LoC fork + ~150 LoC loader + ~50 LoC reference/
-test plumbing = several hours of careful work. Worth doing for the
-WAL-volume win, but not the quick-and-easy win we initially scoped.
+We then landed the **surgical** subset described above (BIND/UNBIND/
+LINE only, CALL/RETURN/mutations always emit), which sidesteps all
+three loader assumptions because the loader was already dropping
+exactly those events for `frame_id == -1` frames — the reference
+tracer needed no changes. ~120 LoC fork + ~60 LoC bootstrap, all
+tests still green.
 
-The scaffolding code from the attempt (struct fields, classifier API,
-hook-gate sites) was reverted. Picked up where we left off when we
-revisit, the big ticket items are (a) loader CALL/RETURN handling
-when frames go missing, and (b) reference tracer that mirrors the
-classifier so settrace's view matches.
+When we come back for the full version, the unfinished pieces are:
+1. **Loader CALL/RETURN repair when stdlib frames go missing** —
+   see the existing generator-RETURN logic in loader.py around `match_pos`
+   for a pattern (search the stack for a matching code_idx, pop above
+   that, drop the orphan if no match).
+2. **Reference tracer that mirrors the classifier** — settrace's view
+   needs to match the fork's filter, otherwise the differential test
+   diverges.
+3. **Optional smart-mutation gating** (oid `is_user_visible` bit)
+   only if real captures still have noisy mutation events on
+   stdlib-only objects after CALL/RETURN skipping.
 
 ## 3. tp_dealloc hooks  *(post-demo)*
 
