@@ -39,7 +39,11 @@
 #define MAX_CODE_ENTRIES    4096
 #define MAX_CACHED_FRAMES   256
 #define CODE_HASH_SIZE      8191
-#define OID_MAP_SIZE        16381
+/* Initial capacity of the oid map. Doubles on demand (grow at 75%
+ * load). The map's size grows with objects-ever-tracked because we
+ * have no destruction signal — see exp29 perf-optimization notes
+ * for the full memory story and the planned tp_dealloc-hook fix. */
+#define OID_MAP_INITIAL     16384  /* power of two for cheap modulo via mask */
 #define STRING_INTERN_SIZE  4093
 
 typedef uint32_t oid_t;
@@ -94,12 +98,61 @@ typedef struct {
     uint16_t type_name_idx;
 } OidMapEntry;
 
-static OidMapEntry g_oid_map[OID_MAP_SIZE];
+static OidMapEntry *g_oid_map = NULL;
+static size_t g_oid_map_capacity = 0;  /* always a power of two */
+static size_t g_oid_map_count = 0;     /* live (occupied) entries */
 static oid_t g_next_oid = 1;
 
+/* Probe-step constant. The original 32-step linear probe is preserved
+ * so collision behavior matches the static-array version. With a
+ * resizable map at <= 75% load we should rarely exhaust 32 steps. */
+#define OID_MAP_PROBE_STEPS 32
+
 static void oid_map_init(void) {
-    memset(g_oid_map, 0, sizeof(g_oid_map));
+    if (g_oid_map) {
+        PyMem_Free(g_oid_map);
+    }
+    g_oid_map_capacity = OID_MAP_INITIAL;
+    g_oid_map = (OidMapEntry *)PyMem_Calloc(g_oid_map_capacity, sizeof(OidMapEntry));
+    g_oid_map_count = 0;
     g_next_oid = 1;
+}
+
+/* Grow the oid map to 2× capacity and rehash. Called from oid_create
+ * when load passes 75%. All existing lookup/insert sites use the same
+ * (h + p) & mask probe pattern — they pick up the new capacity
+ * automatically once g_oid_map / g_oid_map_capacity are updated. No
+ * outstanding pointers into the old array exist across function
+ * boundaries, so the realloc is safe. */
+static void oid_map_grow(void) {
+    size_t old_cap = g_oid_map_capacity;
+    OidMapEntry *old_map = g_oid_map;
+    size_t new_cap = old_cap * 2;
+    OidMapEntry *new_map = (OidMapEntry *)PyMem_Calloc(new_cap, sizeof(OidMapEntry));
+    if (!new_map) {
+        /* Out of memory — limp along with the existing map. Inserts
+         * past capacity will fail to record but lookups still work. */
+        return;
+    }
+    size_t mask = new_cap - 1;
+    size_t live = 0;
+    for (size_t i = 0; i < old_cap; i++) {
+        OidMapEntry *src = &old_map[i];
+        if (!src->occupied) continue;
+        uintptr_t h = (src->cpython_id >> 4) & mask;
+        for (int p = 0; p < (int)new_cap; p++) {
+            OidMapEntry *dst = &new_map[(h + p) & mask];
+            if (!dst->occupied) {
+                *dst = *src;
+                live++;
+                break;
+            }
+        }
+    }
+    g_oid_map = new_map;
+    g_oid_map_capacity = new_cap;
+    g_oid_map_count = live;
+    PyMem_Free(old_map);
 }
 
 static uint8_t classify_type(PyObject *obj) {
@@ -121,9 +174,9 @@ static int is_primitive(PyObject *obj) {
 }
 
 static oid_t oid_lookup(uintptr_t cid) {
-    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    uintptr_t h = (cid >> 4) & (g_oid_map_capacity - 1);
     for (int p = 0; p < 32; p++) {
-        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        OidMapEntry *e = &g_oid_map[(h + p) & (g_oid_map_capacity - 1)];
         if (!e->occupied) return OID_NONE;
         if (e->cpython_id == cid) return e->oid;
     }
@@ -134,10 +187,15 @@ static oid_t oid_lookup(uintptr_t cid) {
 static uint16_t string_intern(PyObject *name);
 
 static oid_t oid_create(uintptr_t cid, uint8_t type_tag, PyObject *obj_for_typename) {
+    /* Grow the map if it's getting full before we probe for a free slot.
+     * 75% load keeps probe chains short; growth doubles capacity. */
+    if (g_oid_map_count * 4 >= g_oid_map_capacity * 3) {
+        oid_map_grow();
+    }
     oid_t oid = g_next_oid++;
-    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    uintptr_t h = (cid >> 4) & (g_oid_map_capacity - 1);
     for (int p = 0; p < 32; p++) {
-        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        OidMapEntry *e = &g_oid_map[(h + p) & (g_oid_map_capacity - 1)];
         if (!e->occupied) {
             e->cpython_id = cid;
             e->oid = oid;
@@ -161,6 +219,7 @@ static oid_t oid_create(uintptr_t cid, uint8_t type_tag, PyObject *obj_for_typen
                     PyErr_Clear();
                 }
             }
+            g_oid_map_count++;
             return oid;
         }
     }
@@ -170,9 +229,9 @@ static oid_t oid_create(uintptr_t cid, uint8_t type_tag, PyObject *obj_for_typen
 
 /* Find the oid_map entry for cid and set/clear its snapshot_fresh bit. */
 static void oid_mark_snapshot_fresh(uintptr_t cid, uint8_t value) {
-    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    uintptr_t h = (cid >> 4) & (g_oid_map_capacity - 1);
     for (int p = 0; p < 32; p++) {
-        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        OidMapEntry *e = &g_oid_map[(h + p) & (g_oid_map_capacity - 1)];
         if (!e->occupied) return;
         if (e->cpython_id == cid) {
             e->snapshot_fresh = value;
@@ -192,20 +251,22 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line);
 static oid_t oid_get_or_create_for_mutation(PyObject *obj, int32_t line) {
     uintptr_t cid = (uintptr_t)obj;
     uint8_t type_tag = classify_type(obj);
-    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    uintptr_t h = (cid >> 4) & (g_oid_map_capacity - 1);
     for (int p = 0; p < 32; p++) {
-        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        OidMapEntry *e = &g_oid_map[(h + p) & (g_oid_map_capacity - 1)];
         if (!e->occupied) break;
         if (e->cpython_id == cid) {
             if (e->type_tag == type_tag) {
                 if (type_tag == 4 /* tuple */) {
                     e->occupied = 0;
+                    if (g_oid_map_count) g_oid_map_count--;
                     break;
                 }
                 e->snapshot_fresh = 0;
                 return e->oid;
             }
             e->occupied = 0;
+            if (g_oid_map_count) g_oid_map_count--;
             break;
         }
     }
@@ -213,12 +274,13 @@ static oid_t oid_get_or_create_for_mutation(PyObject *obj, int32_t line) {
 }
 
 static void oid_invalidate(uintptr_t cid) {
-    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    uintptr_t h = (cid >> 4) & (g_oid_map_capacity - 1);
     for (int p = 0; p < 32; p++) {
-        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        OidMapEntry *e = &g_oid_map[(h + p) & (g_oid_map_capacity - 1)];
         if (!e->occupied) return;
         if (e->cpython_id == cid) {
             e->occupied = 0;
+            if (g_oid_map_count) g_oid_map_count--;
             return;
         }
     }
@@ -242,9 +304,9 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
     uintptr_t cid = (uintptr_t)obj;
     uint8_t type_tag = classify_type(obj);
 
-    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    uintptr_t h = (cid >> 4) & (g_oid_map_capacity - 1);
     for (int p = 0; p < 32; p++) {
-        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        OidMapEntry *e = &g_oid_map[(h + p) & (g_oid_map_capacity - 1)];
         if (!e->occupied) break;
         if (e->cpython_id == cid) {
             if (e->type_tag == type_tag) {
@@ -254,11 +316,13 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
                  * by a new tuple with different contents. Force a new oid. */
                 if (type_tag == 4 /* tuple */) {
                     e->occupied = 0;
+                    if (g_oid_map_count) g_oid_map_count--;
                     break;
                 }
                 return e->oid;
             }
             e->occupied = 0;
+            if (g_oid_map_count) g_oid_map_count--;
             break;
         }
     }
@@ -289,9 +353,9 @@ static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
     }
     uintptr_t cid = (uintptr_t)obj;
     uint8_t type_tag = classify_type(obj);
-    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    uintptr_t h = (cid >> 4) & (g_oid_map_capacity - 1);
     for (int p = 0; p < 32; p++) {
-        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        OidMapEntry *e = &g_oid_map[(h + p) & (g_oid_map_capacity - 1)];
         if (!e->occupied) break;
         if (e->cpython_id == cid && e->type_tag == type_tag) {
             if (type_tag == 1 || type_tag == 2 || type_tag == 3) {
@@ -1645,6 +1709,12 @@ _PyWAL_Start(int buf_size, const char *output_file)
 {
     if (buf_size <= 0) buf_size = WAL_BUF_DEFAULT;
 
+    /* Ensure the oid map is allocated. _PyWAL_Clear inits it; if a caller
+     * skips clear and goes straight to start, do it lazily here too. */
+    if (!g_oid_map) {
+        oid_map_init();
+    }
+
     if (g_wal_buf) PyMem_Free(g_wal_buf);
     g_wal_buf = (uint8_t *)PyMem_Calloc(1, buf_size);
     if (!g_wal_buf) return -1;
@@ -1757,7 +1827,7 @@ _PyWAL_GetOidTypeNames(void)
 {
     PyObject *result = PyDict_New();
     if (!result) return NULL;
-    for (int i = 0; i < OID_MAP_SIZE; i++) {
+    for (size_t i = 0; i < g_oid_map_capacity; i++) {
         OidMapEntry *e = &g_oid_map[i];
         if (!e->occupied) continue;
         if (e->type_name_idx == UINT16_MAX) continue;
