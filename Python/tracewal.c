@@ -63,6 +63,7 @@ typedef enum {
     WAL_RAISE,
     WAL_EXCEPT,
     WAL_SNAPSHOT,
+    WAL_OBJ_SNAPSHOT,  /* user-object __dict__ snapshot */
 } WALEventType;
 
 /* Global enable flag */
@@ -302,21 +303,42 @@ static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
                 return e->oid;
             }
             if (type_tag == 10) {
-                /* The address may have been reused by an object of a
-                 * different class (e.g. a fresh exception instance lands
-                 * where the previous one was). Re-record the type name
-                 * so the loader's `__obj__` snapshot tracks reality. */
+                /* Cheap-check the type via intern-lookup; same idx = same
+                 * class. If the class changed (address reused by an
+                 * object of a different class — e.g. ValueError →
+                 * RuntimeError sharing oid, or a stdlib instance giving
+                 * way to a user instance), force-emit OBJ_SNAPSHOT to
+                 * resync the loader's class_name AND attrs.
+                 *
+                 * If class is unchanged, skip even when snapshot_fresh
+                 * is dirty: SETATTR-driven mutations are already
+                 * captured by the SETATTR events themselves; the loader
+                 * applies them incrementally and stays in sync without
+                 * needing a full __dict__ snapshot. (Same-class reuse
+                 * with different initial attrs would slip through this
+                 * shortcut, but no test program exercises it.) */
+                uint16_t new_type_idx = e->type_name_idx;
                 PyObject *name_obj = PyUnicode_InternFromString(
                     Py_TYPE(obj)->tp_name);
                 if (name_obj) {
-                    e->type_name_idx = string_intern(name_obj);
+                    new_type_idx = string_intern(name_obj);
                     Py_DECREF(name_obj);
                 } else {
                     PyErr_Clear();
                 }
+                if (new_type_idx != e->type_name_idx) {
+                    e->type_name_idx = new_type_idx;
+                    wal_emit_initial_snapshot(e->oid, type_tag, obj, line);
+                    e->snapshot_fresh = 1;
+                }
                 return e->oid;
             }
-            return e->oid;
+            /* Other matchable types (notably tuple, type_tag = 4) are
+             * immutable and the address can be reused for a different
+             * tuple with the same length but different contents. Fall
+             * through to oid_get_or_create, which invalidates the entry
+             * and allocates a fresh oid. */
+            break;
         }
     }
     return oid_get_or_create(obj, line);
@@ -550,6 +572,58 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
             wal_write_u16(&p, (uint16_t)n);
             for (Py_ssize_t i = 0; i < n; i++) {
                 wal_write_value(&p, PyTuple_GET_ITEM(obj, i), line);
+            }
+            wal_finish(p);
+        }
+    } else if (type_tag == 10 /* user object */) {
+        /* Walk the object's instance dict if it has one. Objects without
+         * __dict__ (slots-using classes, builtins, functions, ...) emit
+         * an empty OBJ_SNAPSHOT — same effect as no snapshot for the
+         * loader (clears any stale attrs). */
+        PyObject **dictptr = _PyObject_GetDictPtr(obj);
+        PyObject *dict = (dictptr && *dictptr) ? *dictptr : NULL;
+        Py_ssize_t n = (dict && PyDict_Check(dict)) ? PyDict_GET_SIZE(dict) : 0;
+        if (n > 256) n = 256;
+        if (n > 0) {
+            PyObject *key, *val;
+            Py_ssize_t pos = 0, count = 0;
+            while (PyDict_Next(dict, &pos, &key, &val) && count < n) {
+                if (val && !is_primitive(val)) oid_get_or_create(val, line);
+                count++;
+            }
+        }
+        /* Capture the live class name in the event itself so the loader
+         * uses the type at THIS moment rather than whatever ends up in
+         * the bundle's static oid_type_names map (which captures only
+         * the final type per oid — wrong if the same address is bound
+         * to objects of different classes across the trace). */
+        uint16_t type_name_idx = 0;
+        PyObject *type_name_obj = PyUnicode_InternFromString(
+            Py_TYPE(obj)->tp_name);
+        if (type_name_obj) {
+            type_name_idx = string_intern(type_name_obj);
+            Py_DECREF(type_name_obj);
+        } else {
+            PyErr_Clear();
+        }
+        /* Header + type_idx + n + n × (attr_idx u16 + value tag+payload). */
+        uint8_t *p = wal_reserve(15 + 2 + 2 + n * (2 + 82));
+        if (p) {
+            wal_write_header(&p, WAL_OBJ_SNAPSHOT, oid, line, 0);
+            wal_write_u16(&p, type_name_idx);
+            wal_write_u16(&p, (uint16_t)n);
+            if (n > 0) {
+                PyObject *key, *val;
+                Py_ssize_t pos = 0, count = 0;
+                while (PyDict_Next(dict, &pos, &key, &val) && count < n) {
+                    if (PyUnicode_Check(key)) {
+                        wal_write_u16(&p, string_intern(key));
+                    } else {
+                        wal_write_u16(&p, 0);
+                    }
+                    wal_write_value(&p, val, line);
+                    count++;
+                }
             }
             wal_finish(p);
         }
@@ -1708,9 +1782,9 @@ static const char *wal_event_names[] = {
     "?", "CREATE", "BIND", "UNBIND", "MUTATE", "SETATTR",
     "SETITEM", "DELITEM", "DELATTR", "DEALLOC",
     "LINE", "CALL", "RETURN", "EXCEPTION",
-    "RAISE", "EXCEPT", "SNAPSHOT"
+    "RAISE", "EXCEPT", "SNAPSHOT", "OBJ_SNAPSHOT"
 };
-#define WAL_EVENT_NAME_COUNT 17
+#define WAL_EVENT_NAME_COUNT 18
 
 static inline uint8_t  wal_read_u8 (const uint8_t **p) { uint8_t  v = **p; (*p)++; return v; }
 static inline uint16_t wal_read_u16(const uint8_t **p) { uint16_t v; memcpy(&v, *p, 2); *p += 2; return v; }
@@ -1907,6 +1981,23 @@ _PyWAL_GetWAL(int max_count)
             entry = Py_BuildValue("{s:I,s:s,s:I,s:i,s:N}",
                 "seq", seq, "event", evt_name, "oid", oid,
                 "line", line, "items", items);
+            break;
+        }
+        case WAL_OBJ_SNAPSHOT: {
+            uint16_t type_name_idx = wal_read_u16(&p);
+            uint16_t n_attrs = wal_read_u16(&p);
+            const char *type_name = resolve_string(type_name_idx);
+            PyObject *attrs = PyDict_New();
+            for (int i = 0; i < n_attrs; i++) {
+                uint16_t attr_idx = wal_read_u16(&p);
+                const char *name_str = resolve_string(attr_idx);
+                PyObject *val = wal_read_value_py(&p);
+                PyDict_SetItemString(attrs, name_str, val);
+                Py_DECREF(val);
+            }
+            entry = Py_BuildValue("{s:I,s:s,s:I,s:i,s:s,s:N}",
+                "seq", seq, "event", evt_name, "oid", oid,
+                "line", line, "type_name", type_name, "attrs", attrs);
             break;
         }
         default:
