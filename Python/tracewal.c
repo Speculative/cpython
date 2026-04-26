@@ -78,6 +78,14 @@ typedef struct {
     oid_t oid;
     uint8_t type_tag;
     uint8_t occupied;
+    /* Set whenever a SNAPSHOT was just emitted for this oid (initial or
+     * refresh or post-call). Cleared by any event that mutates the
+     * underlying object (SETITEM/SETATTR/MUTATE/DELITEM/DELATTR). When
+     * the refresh path sees this set, it skips emitting — the existing
+     * snapshot still reflects current contents, so the loader's state
+     * is up to date. Catches the common BUILD_LIST → STORE_FAST case
+     * where a fresh container is bound immediately after creation. */
+    uint8_t snapshot_fresh;
 } OidMapEntry;
 
 static OidMapEntry g_oid_map[OID_MAP_SIZE];
@@ -126,10 +134,55 @@ static oid_t oid_create(uintptr_t cid, uint8_t type_tag) {
             e->oid = oid;
             e->type_tag = type_tag;
             e->occupied = 1;
+            e->snapshot_fresh = 0;  /* set to 1 by oid_mark_snapshot_fresh */
             return oid;
         }
     }
     return oid; /* map full */
+}
+
+/* Find the oid_map entry for cid and set/clear its snapshot_fresh bit. */
+static void oid_mark_snapshot_fresh(uintptr_t cid, uint8_t value) {
+    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    for (int p = 0; p < 32; p++) {
+        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        if (!e->occupied) return;
+        if (e->cpython_id == cid) {
+            e->snapshot_fresh = value;
+            return;
+        }
+    }
+}
+
+static oid_t oid_get_or_create(PyObject *obj, int32_t line);
+
+/* Like oid_get_or_create, but also clears snapshot_fresh on the matched
+ * entry. Use at mutation sites (SETITEM, SETATTR, DELITEM, DELATTR,
+ * MUTATE) so the existing lookup pulls double duty — no extra hash probe
+ * for the bit clear. After the mutation event the loader's reconstructed
+ * state diverges from any prior SNAPSHOT, so a future binding-site
+ * refresh must re-snapshot rather than skip. */
+static oid_t oid_get_or_create_for_mutation(PyObject *obj, int32_t line) {
+    uintptr_t cid = (uintptr_t)obj;
+    uint8_t type_tag = classify_type(obj);
+    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    for (int p = 0; p < 32; p++) {
+        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        if (!e->occupied) break;
+        if (e->cpython_id == cid) {
+            if (e->type_tag == type_tag) {
+                if (type_tag == 4 /* tuple */) {
+                    e->occupied = 0;
+                    break;
+                }
+                e->snapshot_fresh = 0;
+                return e->oid;
+            }
+            e->occupied = 0;
+            break;
+        }
+    }
+    return oid_get_or_create(obj, line);
 }
 
 static void oid_invalidate(uintptr_t cid) {
@@ -186,6 +239,7 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
     oid_t oid = oid_create(cid, type_tag);
     wal_emit_create(oid, type_tag, line);
     wal_emit_initial_snapshot(oid, type_tag, obj, line);
+    oid_mark_snapshot_fresh(cid, 1);
     return oid;
 }
 
@@ -196,7 +250,12 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
  * SNAPSHOT for mutable containers so the loader resets state to the current
  * (post-rebirth) contents. Read/mutation sites use the plain
  * oid_get_or_create — there the caller already knows the oid so no
- * refresh is needed. */
+ * refresh is needed.
+ *
+ * If snapshot_fresh is set, skip — the existing snapshot is still
+ * authoritative (no event has mutated this oid since we last emitted
+ * SNAPSHOT). Catches the very common BUILD_LIST → STORE_FAST case
+ * where a fresh container is bound immediately after creation. */
 static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
     if (g_in_snapshot) {
         return oid_get_or_create(obj, line);
@@ -209,7 +268,11 @@ static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
         if (!e->occupied) break;
         if (e->cpython_id == cid && e->type_tag == type_tag &&
                 (type_tag == 1 || type_tag == 2 || type_tag == 3)) {
+            if (e->snapshot_fresh) {
+                return e->oid;
+            }
             wal_emit_initial_snapshot(e->oid, type_tag, obj, line);
+            e->snapshot_fresh = 1;
             return e->oid;
         }
     }
@@ -859,10 +922,7 @@ _PyWAL_OnStoreSubscr(_PyInterpreterFrame *frame,
     }
 
     oid_t container_oid = is_primitive(container) ? OID_NONE :
-                          oid_lookup((uintptr_t)container);
-    if (container_oid == OID_NONE && !is_primitive(container)) {
-        container_oid = oid_get_or_create(container, line);
-    }
+                          oid_get_or_create_for_mutation(container, line);
 
     uint8_t *p = wal_reserve(WAL_MAX_ENTRY_SIZE);
     if (p) {
@@ -895,10 +955,7 @@ _PyWAL_OnStoreAttr(_PyInterpreterFrame *frame,
     }
 
     oid_t owner_oid = is_primitive(owner) ? OID_NONE :
-                      oid_lookup((uintptr_t)owner);
-    if (owner_oid == OID_NONE && !is_primitive(owner)) {
-        owner_oid = oid_get_or_create(owner, line);
-    }
+                      oid_get_or_create_for_mutation(owner, line);
 
     uint16_t name_idx = string_intern(name);
 
@@ -923,10 +980,8 @@ _PyWAL_OnDeleteSubscr(_PyInterpreterFrame *frame,
 
     int32_t line = get_line_fast(fc->code_idx, frame);
 
-    oid_t container_oid = OID_NONE;
-    if (!is_primitive(container)) {
-        container_oid = oid_get_or_create(container, line);
-    }
+    oid_t container_oid = is_primitive(container) ? OID_NONE :
+                          oid_get_or_create_for_mutation(container, line);
 
     uint8_t *p = wal_reserve(WAL_MAX_ENTRY_SIZE);
     if (p) {
@@ -948,10 +1003,8 @@ _PyWAL_OnDeleteAttr(_PyInterpreterFrame *frame,
 
     int32_t line = get_line_fast(fc->code_idx, frame);
 
-    oid_t owner_oid = OID_NONE;
-    if (!is_primitive(owner)) {
-        owner_oid = oid_get_or_create(owner, line);
-    }
+    oid_t owner_oid = is_primitive(owner) ? OID_NONE :
+                      oid_get_or_create_for_mutation(owner, line);
 
     uint16_t name_idx = string_intern(name);
 
@@ -1064,7 +1117,7 @@ _PyWAL_OnStoreGlobal(_PyInterpreterFrame *frame,
     PyObject *globals_dict = frame->f_globals;
     if (!globals_dict) return;
 
-    oid_t dict_oid = oid_get_or_create(globals_dict, line);
+    oid_t dict_oid = oid_get_or_create_for_mutation(globals_dict, line);
     if (value && !is_primitive(value)) {
         oid_get_or_create(value, line);
     }
@@ -1267,6 +1320,7 @@ _PyWAL_FlushPendingSnapshots(_PyInterpreterFrame *frame)
                       g_pending_snapshots[i].obj,
                       g_pending_snapshots[i].line,
                       g_pending_snapshots[i].code_idx);
+        oid_mark_snapshot_fresh((uintptr_t)g_pending_snapshots[i].obj, 1);
     }
     _PyWAL_pending_snapshots = 0;
 }
@@ -1322,8 +1376,10 @@ _PyWAL_OnCall(_PyInterpreterFrame *frame,
 
     int32_t line = get_line_fast(fc->code_idx, frame);
 
-    /* Pre-create oids for all values */
-    oid_t self_oid = oid_get_or_create(self_or_null, line);
+    /* Pre-create oids for all values. self uses the for_mutation variant
+     * — the method is about to mutate self, so any existing snapshot is
+     * stale and the snapshot_fresh bit is cleared as part of the lookup. */
+    oid_t self_oid = oid_get_or_create_for_mutation(self_or_null, line);
     for (int i = 0; i < oparg; i++) {
         PyObject *arg_obj = PyStackRef_AsPyObjectBorrow(args[i]);
         if (arg_obj && !is_primitive(arg_obj)) {
@@ -1349,7 +1405,10 @@ _PyWAL_OnCall(_PyInterpreterFrame *frame,
         wal_finish(p);
     }
 
-    /* Schedule post-call snapshot for opaque C mutations */
+    /* Schedule post-call snapshot for opaque C mutations.
+     * (For sort/reverse/rotate/set.pop the FlushPending code below sets
+     * snapshot_fresh = 1 again; for other methods, oid_get_or_create_for_mutation
+     * above already cleared it.) */
     if (needs_post_call_snapshot(method_name, self_or_null) &&
         _PyWAL_pending_snapshots < MAX_PENDING_SNAPSHOTS) {
         int i = _PyWAL_pending_snapshots++;
