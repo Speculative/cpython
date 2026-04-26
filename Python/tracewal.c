@@ -148,6 +148,16 @@ static void oid_invalidate(uintptr_t cid) {
 static void wal_emit_create(oid_t oid, uint8_t type_tag, int32_t line);
 static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag, PyObject *obj, int32_t line);
 
+/* Set while wal_emit_initial_snapshot is iterating a container's items and
+ * pre-creating oids for them. While set, the *_refresh variant skips the
+ * existing-oid refresh path — otherwise we'd recursively re-snapshot every
+ * nested mutable container, blowing the stack on cyclic or deep graphs. */
+static int g_in_snapshot = 0;
+
+/* Standard lookup-or-create. Used at mutation sites (SETITEM, SETATTR,
+ * MUTATE method-call self) and value-tagging sites where the caller already
+ * has a known oid. No refresh — the loader's reconstructed state is kept
+ * current via SETITEM/SETATTR/MUTATE events. */
 static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
     uintptr_t cid = (uintptr_t)obj;
     uint8_t type_tag = classify_type(obj);
@@ -177,6 +187,33 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
     wal_emit_create(oid, type_tag, line);
     wal_emit_initial_snapshot(oid, type_tag, obj, line);
     return oid;
+}
+
+/* Like oid_get_or_create, but for binding sites — STORE_FAST, function arg
+ * binding, RETURN value. The Python object being bound here might be at a
+ * memory address recently freed by a now-dead earlier object, in which case
+ * the cached oid_map entry has stale state from that earlier object. Emit a
+ * SNAPSHOT for mutable containers so the loader resets state to the current
+ * (post-rebirth) contents. Read/mutation sites use the plain
+ * oid_get_or_create — there the caller already knows the oid so no
+ * refresh is needed. */
+static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
+    if (g_in_snapshot) {
+        return oid_get_or_create(obj, line);
+    }
+    uintptr_t cid = (uintptr_t)obj;
+    uint8_t type_tag = classify_type(obj);
+    uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
+    for (int p = 0; p < 32; p++) {
+        OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
+        if (!e->occupied) break;
+        if (e->cpython_id == cid && e->type_tag == type_tag &&
+                (type_tag == 1 || type_tag == 2 || type_tag == 3)) {
+            wal_emit_initial_snapshot(e->oid, type_tag, obj, line);
+            return e->oid;
+        }
+    }
+    return oid_get_or_create(obj, line);
 }
 
 /* ========================================================================
@@ -316,9 +353,17 @@ static void wal_emit_create(oid_t oid, uint8_t type_tag, int32_t line) {
 
 static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
                                        PyObject *obj, int32_t line) {
-    /* Emit SNAPSHOT for non-empty containers at creation time so the replayer
-     * knows initial contents (e.g., [1,2,3] from BUILD_LIST). */
-    if (type_tag == 1 /* list */ && PyList_GET_SIZE(obj) > 0) {
+    /* Emit SNAPSHOT of the current container contents. Used both at CREATE
+     * time (initial state) and on existing-oid return for mutable containers
+     * (refresh, since the underlying object may have been reused after GC).
+     * Empty containers still emit an empty SNAPSHOT — the refresh path needs
+     * that to clear stale state.
+     *
+     * Sets g_in_snapshot while iterating items so the recursive
+     * oid_get_or_create calls below don't re-snapshot nested containers. */
+    int saved_in_snapshot = g_in_snapshot;
+    g_in_snapshot = 1;
+    if (type_tag == 1 /* list */) {
         Py_ssize_t n = PyList_GET_SIZE(obj);
         if (n > 256) n = 256;
         /* Pre-create oids for non-primitive elements so wal_write_value
@@ -338,7 +383,7 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
             }
             wal_finish(p);
         }
-    } else if (type_tag == 2 /* dict */ && PyDict_GET_SIZE(obj) > 0) {
+    } else if (type_tag == 2 /* dict */) {
         PyObject *key, *val;
         Py_ssize_t pos = 0;
         Py_ssize_t pairs = PyDict_GET_SIZE(obj);
@@ -363,7 +408,7 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
             }
             wal_finish(p);
         }
-    } else if (type_tag == 3 /* set */ && PySet_GET_SIZE(obj) > 0) {
+    } else if (type_tag == 3 /* set */) {
         PyObject *iter = PyObject_GetIter(obj);
         if (iter) {
             PyObject *items[256];
@@ -386,7 +431,7 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
                 for (Py_ssize_t i = 0; i < n; i++) Py_DECREF(items[i]);
             }
         }
-    } else if (type_tag == 4 /* tuple */ && PyTuple_GET_SIZE(obj) > 0) {
+    } else if (type_tag == 4 /* tuple */) {
         Py_ssize_t n = PyTuple_GET_SIZE(obj);
         if (n > 256) n = 256;
         for (Py_ssize_t i = 0; i < n; i++) {
@@ -403,6 +448,7 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
             wal_finish(p);
         }
     }
+    g_in_snapshot = saved_in_snapshot;
 }
 
 /* ========================================================================
@@ -702,7 +748,7 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
                     wal_finish(p);
                 }
             } else {
-                oid_t oid = oid_get_or_create(val, line);
+                oid_t oid = oid_get_or_create_refresh(val, line);
                 fc->bound_oids[i] = oid;
                 uint8_t *p = wal_reserve(15 + 2);
                 if (p) {
@@ -766,7 +812,7 @@ _PyWAL_OnStoreFast(_PyInterpreterFrame *frame, int local_idx,
         }
         fc->bound_oids[local_idx] = OID_NONE;
     } else {
-        oid_t new_oid = oid_get_or_create(new_obj, line);
+        oid_t new_oid = oid_get_or_create_refresh(new_obj, line);
 
         if (old_oid != OID_NONE && old_oid != new_oid) {
             uint8_t *p = wal_reserve(15 + 2);
@@ -949,9 +995,12 @@ _PyWAL_OnReturn(_PyInterpreterFrame *frame, PyObject *retval)
         }
     }
 
-    /* Emit RETURN with return value */
+    /* Emit RETURN with return value. Use the refresh variant: a returned
+     * value crosses a frame boundary and might land in a caller's slot
+     * whose previous occupant was at the same address — a snapshot here
+     * makes sure the loader sees the current contents. */
     if (retval && !is_primitive(retval)) {
-        oid_get_or_create(retval, line);
+        oid_get_or_create_refresh(retval, line);
     }
     uint8_t *p = wal_reserve(WAL_MAX_ENTRY_SIZE);
     if (p) {
@@ -1505,6 +1554,21 @@ _PyWAL_Clear(void)
         g_string_table[i] = NULL;
     }
     string_intern_init();
+}
+
+/* Return the interned string table as a Python list. The loader uses this
+ * to resolve method_idx (in MUTATE events) and attr_idx (in SETATTR/DELATTR)
+ * to actual names — without it, the loader can't apply container mutations. */
+PyObject *
+_PyWAL_GetStringTable(void)
+{
+    PyObject *result = PyList_New(g_n_strings);
+    if (!result) return NULL;
+    for (int i = 0; i < g_n_strings; i++) {
+        PyObject *s = g_string_table[i];
+        PyList_SET_ITEM(result, i, s ? Py_NewRef(s) : Py_NewRef(Py_None));
+    }
+    return result;
 }
 
 /* ---- WAL decoder (identical format to ctrace_wal_compact.c) ---- */

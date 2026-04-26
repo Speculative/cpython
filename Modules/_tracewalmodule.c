@@ -66,6 +66,12 @@ tracewal_clear(PyObject *self, PyObject *Py_UNUSED(ignored))
 }
 
 static PyObject *
+tracewal_get_string_table(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return _PyWAL_GetStringTable();
+}
+
+static PyObject *
 tracewal_register_code(PyObject *self, PyObject *args)
 {
     /* Compatibility with _ctrace_wal's register_code(code, first_line, line_data, strings).
@@ -92,6 +98,8 @@ static PyMethodDef methods[] = {
      "Get tracing statistics."},
     {"get_wal", tracewal_get_wal, METH_VARARGS,
      "Get WAL entries as list of dicts."},
+    {"get_string_table", tracewal_get_string_table, METH_NOARGS,
+     "Return interned strings (method/attr names) as a list."},
     {"clear", tracewal_clear, METH_NOARGS,
      "Clear all tracing state."},
     {NULL, NULL, 0, NULL}
