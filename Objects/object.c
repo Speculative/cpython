@@ -28,6 +28,7 @@
 #include "pycore_pyerrors.h"      // _PyErr_Occurred()
 #include "pycore_pymem.h"         // _PyMem_IsPtrFreed()
 #include "pycore_pystate.h"       // _PyThreadState_GET()
+#include "pycore_tracewal.h"      // _PyWAL_OnObjectDealloc()
 #include "pycore_symtable.h"      // PySTEntry_Type
 #include "pycore_template.h"      // _PyTemplate_Type _PyTemplateIter_Type
 #include "pycore_tuple.h"         // _PyTuple_DebugMallocStats()
@@ -3278,6 +3279,12 @@ _Py_Dealloc(PyObject *op)
     if (margin < 2 && gc_flag) {
         _PyTrash_thread_deposit_object(tstate, (PyObject *)op);
         return;
+    }
+    /* Universal oid_map invalidation hook — gated on _PyWAL_enabled so the
+     * cost is one branch when tracing is off. When on, oid_invalidate's
+     * fast path (no map → return) keeps the miss case cheap. */
+    if (_PyWAL_enabled) {
+        _PyWAL_OnObjectDealloc(op);
     }
 #ifdef Py_DEBUG
 #if !defined(Py_GIL_DISABLED) && !defined(Py_STACKREF_DEBUG)

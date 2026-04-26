@@ -96,14 +96,6 @@ typedef struct {
      * snapshots with the actual class name (Counter, function, etc)
      * rather than a generic "object" placeholder. 0 means unset. */
     uint16_t type_name_idx;
-    /* For type_tag = 10, the (borrowed) Py_TYPE(obj) pointer at insert
-     * time. Compared on lookup to detect cross-class address reuse —
-     * when an Item lands at a recycled Tokenizer address, the lookup
-     * sees a type-pointer mismatch and invalidates the entry so the
-     * caller emits a fresh CREATE+SNAPSHOT with the right class name
-     * and attrs. Tracked separately from type_name_idx because the
-     * pointer compare is O(1) (no string intern) on every lookup. */
-    PyTypeObject *type_ptr;
 } OidMapEntry;
 
 static OidMapEntry *g_oid_map = NULL;
@@ -211,7 +203,6 @@ static oid_t oid_create(uintptr_t cid, uint8_t type_tag, PyObject *obj_for_typen
             e->occupied = 1;
             e->snapshot_fresh = 0;  /* set to 1 by oid_mark_snapshot_fresh */
             e->type_name_idx = UINT16_MAX;  /* "no name recorded" */
-            e->type_ptr = NULL;
             /* For user objects, record Py_TYPE(obj)->tp_name so the loader
              * can render `__obj__` with the actual class name instead of
              * generic "object". Folded in here to avoid a second hash
@@ -219,9 +210,8 @@ static oid_t oid_create(uintptr_t cid, uint8_t type_tag, PyObject *obj_for_typen
              * the PyObject available (e.g. wal_write_value's value-tagging
              * path). */
             if (type_tag == 10 && obj_for_typename) {
-                PyTypeObject *tp = Py_TYPE(obj_for_typename);
-                e->type_ptr = tp;
-                PyObject *name_obj = PyUnicode_InternFromString(tp->tp_name);
+                PyObject *name_obj = PyUnicode_InternFromString(
+                    Py_TYPE(obj_for_typename)->tp_name);
                 if (name_obj) {
                     e->type_name_idx = string_intern(name_obj);
                     Py_DECREF(name_obj);
@@ -297,49 +287,6 @@ static void oid_invalidate(uintptr_t cid) {
     }
 }
 
-/* tp_dealloc hooks — invalidate the oid_map entry for a freed mutable
- * container so a subsequent allocation at the same address gets a fresh oid
- * (with CREATE + SNAPSHOT). Without this, oid_get_or_create_refresh's
- * snapshot_fresh shortcut returns the prior occupant's oid and the loader
- * sees the new binding inherit stale contents.
- *
- * Installed once at _PyWAL_Start time on PyList_Type, PyDict_Type, PySet_Type.
- * Tuples are immutable and already invalidated on type-tag-match lookup.
- *
- * User-defined classes (type_tag = 10) handle the cross-class reuse case
- * via type-pointer comparison in oid_get_or_create — wrapping their
- * tp_dealloc breaks weakref/threading machinery in stdlib. */
-static destructor g_orig_list_dealloc;
-static destructor g_orig_dict_dealloc;
-static destructor g_orig_set_dealloc;
-static int g_dealloc_hooks_installed = 0;
-
-static void wal_list_dealloc(PyObject *obj) {
-    if (_PyWAL_enabled) oid_invalidate((uintptr_t)obj);
-    g_orig_list_dealloc(obj);
-}
-
-static void wal_dict_dealloc(PyObject *obj) {
-    if (_PyWAL_enabled) oid_invalidate((uintptr_t)obj);
-    g_orig_dict_dealloc(obj);
-}
-
-static void wal_set_dealloc(PyObject *obj) {
-    if (_PyWAL_enabled) oid_invalidate((uintptr_t)obj);
-    g_orig_set_dealloc(obj);
-}
-
-static void install_dealloc_hooks(void) {
-    if (g_dealloc_hooks_installed) return;
-    g_orig_list_dealloc = PyList_Type.tp_dealloc;
-    PyList_Type.tp_dealloc = wal_list_dealloc;
-    g_orig_dict_dealloc = PyDict_Type.tp_dealloc;
-    PyDict_Type.tp_dealloc = wal_dict_dealloc;
-    g_orig_set_dealloc = PySet_Type.tp_dealloc;
-    PySet_Type.tp_dealloc = wal_set_dealloc;
-    g_dealloc_hooks_installed = 1;
-}
-
 /* Forward declarations */
 static void wal_emit_create(oid_t oid, uint8_t type_tag, int32_t line);
 static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag, PyObject *obj, int32_t line);
@@ -369,25 +316,6 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
                  * oid invalidation on return, a freed tuple's id can be reused
                  * by a new tuple with different contents. Force a new oid. */
                 if (type_tag == 4 /* tuple */) {
-                    e->occupied = 0;
-                    if (g_oid_map_count) g_oid_map_count--;
-                    break;
-                }
-                /* User-object cross-class reuse: a freed instance's address
-                 * has been recycled by an instance of a *different* class
-                 * (Tokenizer → Item, ValueError → RuntimeError). The cached
-                 * oid carries the prior class's name and attrs in the
-                 * loader's reconstructed state. Force a new oid via
-                 * fall-through to oid_create so the loader sees a fresh
-                 * CREATE+OBJ_SNAPSHOT with the right class.
-                 *
-                 * Pointer compare is O(1) — the type pointer was recorded
-                 * on insert. The refresh path does the equivalent via
-                 * type-name comparison and emits a refresh OBJ_SNAPSHOT in
-                 * place; this path emits a fresh oid because nested-item
-                 * snapshots aren't a refresh site. */
-                if (type_tag == 10 && e->type_ptr &&
-                    e->type_ptr != Py_TYPE(obj)) {
                     e->occupied = 0;
                     if (g_oid_map_count) g_oid_map_count--;
                     break;
@@ -440,34 +368,12 @@ static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
                 return e->oid;
             }
             if (type_tag == 10) {
-                /* Detect cross-class address reuse via type-pointer
-                 * compare — same pointer = same class. If the class
-                 * changed (address reused by an instance of a different
-                 * class, e.g. ValueError → RuntimeError, or a stdlib
-                 * instance giving way to a user instance), force-emit
-                 * OBJ_SNAPSHOT to resync the loader's class_name AND
-                 * attrs, and update the cached type metadata.
-                 *
-                 * If class is unchanged, skip even when snapshot_fresh
-                 * is dirty: SETATTR-driven mutations are already
-                 * captured by the SETATTR events themselves; the loader
-                 * applies them incrementally and stays in sync without
-                 * needing a full __dict__ snapshot. (Same-class reuse
-                 * with different initial attrs would slip through this
-                 * shortcut, but no test program exercises it.) */
-                if (e->type_ptr != Py_TYPE(obj)) {
-                    e->type_ptr = Py_TYPE(obj);
-                    PyObject *name_obj = PyUnicode_InternFromString(
-                        Py_TYPE(obj)->tp_name);
-                    if (name_obj) {
-                        e->type_name_idx = string_intern(name_obj);
-                        Py_DECREF(name_obj);
-                    } else {
-                        PyErr_Clear();
-                    }
-                    wal_emit_initial_snapshot(e->oid, type_tag, obj, line);
-                    e->snapshot_fresh = 1;
-                }
+                /* No special handling needed — when the address was
+                 * recycled, _Py_Dealloc's invalidation hook cleared the
+                 * map entry, so we'd never reach this branch with a
+                 * stale class. Mutations that don't change identity
+                 * are already captured incrementally via SETATTR
+                 * events; full OBJ_SNAPSHOT refresh isn't required. */
                 return e->oid;
             }
             /* Other matchable types (notably tuple, type_tag = 4) are
@@ -995,6 +901,19 @@ static inline int32_t get_current_line(_PyInterpreterFrame *frame) {
  * On every DISPATCH(), we check if the line changed. If so, emit WAL_LINE. */
 static _PyInterpreterFrame *g_last_line_frame = NULL;
 static int32_t g_last_line_num = -1;
+
+/* Called from Objects/object.c::_Py_Dealloc before the type's tp_dealloc
+ * runs. _Py_Dealloc is the universal funnel for every refcount-driven AND
+ * GC-driven object death, so dropping a hash-probe-based invalidate here
+ * gives us full coverage with no slot patching. Cost: one branch +
+ * (on hit) one hash probe per dying PyObject. The oid_invalidate fast-
+ * path (no g_oid_map → return) makes calls during shutdown / non-traced
+ * runs effectively free. */
+void
+_PyWAL_OnObjectDealloc(PyObject *op)
+{
+    oid_invalidate((uintptr_t)op);
+}
 
 void
 _PyWAL_CheckLine(_PyInterpreterFrame *frame)
@@ -1862,11 +1781,6 @@ _PyWAL_Start(int buf_size, const char *output_file)
         oid_map_init();
     }
 
-    /* Install tp_dealloc hooks for built-in mutable containers so freed
-     * objects' oid_map entries get invalidated. Without this, a fresh
-     * allocation at a recycled address inherits the prior occupant's oid
-     * and the refresh path's snapshot_fresh shortcut yields stale state. */
-    install_dealloc_hooks();
 
     if (g_wal_buf) PyMem_Free(g_wal_buf);
     g_wal_buf = (uint8_t *)PyMem_Calloc(1, buf_size);

@@ -52,6 +52,13 @@ extern void _PyWAL_FlushPendingSnapshots(_PyInterpreterFrame *frame);
 extern int _PyWAL_pending_snapshots;  /* nonzero if snapshots need flushing */
 extern void _PyWAL_CheckLine(_PyInterpreterFrame *frame);
 
+/* Called from _Py_Dealloc before the actual tp_dealloc fires. Invalidates
+ * the oid_map entry for the dying object so a subsequent allocation at the
+ * same address gets a fresh oid (with a fresh CREATE+SNAPSHOT). Universal
+ * coverage — every refcount-driven AND GC-driven object death funnels here,
+ * so this catches list/dict/set, user classes, and exotic types alike. */
+extern void _PyWAL_OnObjectDealloc(PyObject *op);
+
 /* Python module API (called from _tracewalmodule.c) */
 extern int     _PyWAL_Start(int buf_size, const char *output_file);
 extern void    _PyWAL_Stop(void);

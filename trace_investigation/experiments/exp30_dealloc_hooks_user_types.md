@@ -1,27 +1,28 @@
-# exp30 — `tp_dealloc` hooks for user-defined classes (attempted, abandoned)
+# exp30 — `tp_dealloc` slot-patching for user-defined classes (attempted, abandoned)
 
-**Status (2026-04-26):** abandoned in favor of type-pointer comparison in
-`oid_get_or_create`. Documented here so a future round can either pick this
-back up under different constraints, or reuse the failure analysis.
+**Status (2026-04-26):** abandoned in favor of a single hook in
+`Objects/object.c::_Py_Dealloc`. This page documents the slot-patching
+attempt and the failure modes that led us to the simpler approach, so a
+future round doesn't re-walk the same ground.
 
 ## Problem
 
 `oid_get_or_create_refresh` short-circuits via `snapshot_fresh`. When an
 address is recycled across object lifetimes, the cached oid carries the
-prior occupant's loader state. Phase-1 fix landed `tp_dealloc` hooks on
-`PyList_Type`, `PyDict_Type`, `PySet_Type` (built-in mutable containers).
-That fixes the list/dict/set case but not user-defined classes:
-**Tokenizer instances dying at addresses later occupied by Items** caused
-the inspector to render Items as Tokenizers (with mixed Tokenizer + Item
-attrs) — spotted in `order_pipeline.atrace`'s second
-`OrderProcessor.process` call.
+prior occupant's loader state.
 
-## Approach attempted
+For built-in mutable containers (`list`, `dict`, `set`), straightforward:
+patch `PyXxx_Type.tp_dealloc` to invalidate the oid_map on free.
+
+For user-defined classes (heap types) the obvious extension was: do the
+same thing per-heap-type, lazily as we see them. **It doesn't work in
+practice.**
+
+## What we tried
 
 Lazy-patch `tp_dealloc` per heap-type at first sight in `oid_create`:
 
-- Maintain a fixed-size table `g_user_type_deallocs[256]` of
-  `(PyTypeObject*, original tp_dealloc)`.
+- Fixed-size table `g_user_type_deallocs[256]` of `(PyTypeObject*, original)`.
 - `wal_user_obj_dealloc` looks up `Py_TYPE(obj)` in the table and dispatches
   to the saved original after invalidating the oid_map entry.
 - Patch only heap types (`Py_TPFLAGS_HEAPTYPE`).
@@ -30,71 +31,80 @@ Lazy-patch `tp_dealloc` per heap-type at first sight in `oid_create`:
 
 ## Failure modes encountered (in order discovered)
 
-1. **Static types (`type`, exceptions) hung at shutdown.**
-   Skipped with the `Py_TPFLAGS_HEAPTYPE` check. *(Necessary, not
-   sufficient.)*
+1. **Static types hung at shutdown.** Patching `type` itself (it's a
+   `type_tag = 10` user-object value as far as the trace can tell) wedged
+   the interpreter mid-shutdown. Skipped with `Py_TPFLAGS_HEAPTYPE`.
+   *(Necessary, not sufficient.)*
 
 2. **Inheritance leaks.** Subclasses of patched types inherit
-   `wal_user_obj_dealloc` at their slot via `inherit_slots` during
-   `PyType_Ready`. The subclass isn't in our table → wrapper returns
-   without calling original → object leaks → interpreter wedges.
-   Mitigated by walking the base chain at lookup time, but only partially.
+   `wal_user_obj_dealloc` via `inherit_slots` during `PyType_Ready`. The
+   subclass isn't in our table → wrapper returns without calling original
+   → object leaks → interpreter wedges. Mitigated by walking the base
+   chain at lookup time, but the table lookup never matches the subclass
+   itself, only ancestors.
 
 3. **Custom C-extension `tp_dealloc` slots.** `_thread.lock`,
    `_thread.RLock`, weakref subclasses (`KeyedRef`), and friends have
-   custom destructors with their own resource invariants. Replacing them
-   with our wrapper:
-   - For `_thread.lock`: hangs the interpreter mid-import (locks are
-     load-bearing for `importlib._bootstrap`).
-   - For `KeyedRef`: causes import of `enum`/`dataclasses`/`re` to hang.
+   custom destructors with their own resource invariants. Replacing them:
+   - `_thread.lock` hangs interpreter mid-import (locks are load-bearing
+     for `importlib._bootstrap`).
+   - `KeyedRef` hangs `import enum`/`dataclasses`/`re`.
      `KeyedRef.tp_dealloc` resolves to `subtype_dealloc` (heap-type
-     generic), which our pointer-equality filter on
-     `g_canonical_subtype_dealloc` did *not* exclude — so the patch
-     applied and broke `WeakValueDictionary` cleanup downstream.
+     generic), so a pointer-equality filter on
+     `g_canonical_subtype_dealloc` doesn't exclude it — patch applied,
+     `WeakValueDictionary` cleanup broke downstream.
 
    Filter "only patch tp_dealloc == canonical subtype_dealloc" was
-   necessary but again not sufficient: heap-type subclasses of
-   `weakref.ref` inherit subtype_dealloc transitively.
+   necessary but not sufficient: heap-type subclasses of `weakref.ref`
+   inherit subtype_dealloc transitively, which our filter doesn't see.
 
 4. **Cumulative complexity.** Each filter ruled out *some* problem types
-   while still leaving others. Final attempt before abandoning had four
-   layers of guards (heap-only, canonical-subtype-only, MRO walk,
+   while still leaving others. The final attempt before abandoning had
+   four layers of guards (heap-only, canonical-subtype-only, MRO walk,
    first-original fallback) and still hung on `import enum`.
 
-## Why we abandoned
+## Why slot-patching fails structurally
 
-- Each new failure required another guard. The set of types whose
-  destructor is unsafe to wrap appears to be open-ended (any C extension
-  with custom `tp_dealloc`, plus their pure-Python heap-type subclasses).
-- The structural fix (true dealloc invalidation for *every* heap type)
-  needs deeper integration — likely a GC-callback rather than slot
-  patching — and that's a multi-day investigation in CPython internals.
-- For the demo we accept slightly more work in `oid_get_or_create` (a
-  pointer compare on every type-tag-10 lookup) in exchange for a
-  one-line surface area and zero interpreter-internals risk.
+Slot patching is per-type. Each type has its own `tp_dealloc` field. The
+*safe* set of types to patch (pure Python `class Foo: ...` heap types
+inheriting `subtype_dealloc`) overlaps with the *unsafe* set (heap types
+whose `subtype_dealloc` chain leads to a custom C destructor downstream)
+in ways we can't tell apart at slot-write time. Each new failure
+discovered another corner — and after spending the day chasing them we
+still couldn't enumerate the unsafe set ahead of time.
 
 ## What landed instead
 
-`OidMapEntry.type_ptr` records `Py_TYPE(obj)` at insert time. On lookup
-in `oid_get_or_create` (and `oid_get_or_create_refresh`), if `type_ptr`
-mismatches `Py_TYPE(obj)`, the entry is invalidated → fresh oid +
-CREATE+OBJ_SNAPSHOT. Cost: one pointer compare per type-10 lookup (no
-`InternFromString`); ~0% measured perf delta on the LARGE_WORKLOADS
-suite (2.24x → 2.26x ALL, within noise).
+A single hook in CPython's `Objects/object.c::_Py_Dealloc`:
 
-Limitation kept: same-class same-address reuse with a different initial
-`__dict__` still slips through. Not exercised by current tests; would
-need true dealloc invalidation to close.
+```c
+if (_PyWAL_enabled) {
+    _PyWAL_OnObjectDealloc(op);
+}
+(*dealloc)(op);
+```
 
-## If you pick this back up
+`_Py_Dealloc` is the universal funnel for every refcount-driven *and*
+GC-driven object death. The hook calls `oid_invalidate((uintptr_t)op)`
+before the type's own destructor runs. No per-type tracking, no
+inheritance issues, no slot rewrites — just one well-placed call site
+in the dispatcher every PyObject already passes through.
 
-The path that's most likely to actually work:
-1. **GC callback** instead of slot patching — register a callback that
-   fires on every collected/destroyed object, regardless of type. CPython
-   3.13's `PyUnstable_GC_VisitObjects` or a `gc.callbacks` listener
-   could be the seam, though the latter is Python-level and per-cycle.
-2. **PEP 683 immortal-object hardening** affects how some types' refcount
-   behaves at shutdown — verify before patching slots.
-3. Look at how `tracemalloc` handles this — it tracks every allocation
-   without slot-patching, via `PyMem_SetAllocator` interposition. That's
-   probably the right model.
+This also made the `OidMapEntry.type_ptr` cross-class detection
+unnecessary (it was a workaround for the slot-patching approach not
+covering user types) and the per-type list/dict/set wrappers redundant.
+Net code change vs. the slot-patching attempt: **smaller**, not bigger.
+
+Cost on `LARGE_WORKLOADS`: 2.24x → 2.30x ALL (~3% delta, within
+run-to-run noise). Per-workload all under 5x; closes the same-class
+user-object pollution gap that slot-patching would've left behind.
+
+## Lesson
+
+When a hook is dispatched to from a single C function in CPython,
+intercepting that function (one site, one call) tends to beat patching
+N type slots (N sites, fragile invariants per type). We tried slots
+first because the demo's prior fix used slot-patching for list/dict/set
+and the framing in HANDOFF read "tp_dealloc hooks" naturally as
+slot-patching — but the universal funnel was always the cleaner shape,
+once you look at it.
