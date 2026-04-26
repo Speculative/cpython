@@ -72,6 +72,12 @@ tracewal_get_string_table(PyObject *self, PyObject *Py_UNUSED(ignored))
 }
 
 static PyObject *
+tracewal_get_oid_type_names(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+    return _PyWAL_GetOidTypeNames();
+}
+
+static PyObject *
 tracewal_register_code(PyObject *self, PyObject *args)
 {
     /* Compatibility with _ctrace_wal's register_code(code, first_line, line_data, strings).
@@ -100,6 +106,8 @@ static PyMethodDef methods[] = {
      "Get WAL entries as list of dicts."},
     {"get_string_table", tracewal_get_string_table, METH_NOARGS,
      "Return interned strings (method/attr names) as a list."},
+    {"get_oid_type_names", tracewal_get_oid_type_names, METH_NOARGS,
+     "Return {oid: type_name} for non-container objects."},
     {"clear", tracewal_clear, METH_NOARGS,
      "Clear all tracing state."},
     {NULL, NULL, 0, NULL}

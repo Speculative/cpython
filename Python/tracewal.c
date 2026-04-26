@@ -86,6 +86,11 @@ typedef struct {
      * is up to date. Catches the common BUILD_LIST → STORE_FAST case
      * where a fresh container is bound immediately after creation. */
     uint8_t snapshot_fresh;
+    /* For type_tag = 10 (user object), the index in g_string_table of
+     * Py_TYPE(obj)->tp_name. The loader uses this to render `__obj__`
+     * snapshots with the actual class name (Counter, function, etc)
+     * rather than a generic "object" placeholder. 0 means unset. */
+    uint16_t type_name_idx;
 } OidMapEntry;
 
 static OidMapEntry g_oid_map[OID_MAP_SIZE];
@@ -124,7 +129,10 @@ static oid_t oid_lookup(uintptr_t cid) {
     return OID_NONE;
 }
 
-static oid_t oid_create(uintptr_t cid, uint8_t type_tag) {
+/* Forward decl */
+static uint16_t string_intern(PyObject *name);
+
+static oid_t oid_create(uintptr_t cid, uint8_t type_tag, PyObject *obj_for_typename) {
     oid_t oid = g_next_oid++;
     uintptr_t h = (cid >> 4) % OID_MAP_SIZE;
     for (int p = 0; p < 32; p++) {
@@ -135,11 +143,29 @@ static oid_t oid_create(uintptr_t cid, uint8_t type_tag) {
             e->type_tag = type_tag;
             e->occupied = 1;
             e->snapshot_fresh = 0;  /* set to 1 by oid_mark_snapshot_fresh */
+            e->type_name_idx = UINT16_MAX;  /* "no name recorded" */
+            /* For user objects, record Py_TYPE(obj)->tp_name so the loader
+             * can render `__obj__` with the actual class name instead of
+             * generic "object". Folded in here to avoid a second hash
+             * lookup; obj_for_typename is NULL for callers that don't have
+             * the PyObject available (e.g. wal_write_value's value-tagging
+             * path). */
+            if (type_tag == 10 && obj_for_typename) {
+                PyObject *name_obj = PyUnicode_InternFromString(
+                    Py_TYPE(obj_for_typename)->tp_name);
+                if (name_obj) {
+                    e->type_name_idx = string_intern(name_obj);
+                    Py_DECREF(name_obj);
+                } else {
+                    PyErr_Clear();
+                }
+            }
             return oid;
         }
     }
     return oid; /* map full */
 }
+
 
 /* Find the oid_map entry for cid and set/clear its snapshot_fresh bit. */
 static void oid_mark_snapshot_fresh(uintptr_t cid, uint8_t value) {
@@ -236,7 +262,7 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
         }
     }
 
-    oid_t oid = oid_create(cid, type_tag);
+    oid_t oid = oid_create(cid, type_tag, obj);
     wal_emit_create(oid, type_tag, line);
     wal_emit_initial_snapshot(oid, type_tag, obj, line);
     oid_mark_snapshot_fresh(cid, 1);
@@ -266,13 +292,30 @@ static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
     for (int p = 0; p < 32; p++) {
         OidMapEntry *e = &g_oid_map[(h + p) % OID_MAP_SIZE];
         if (!e->occupied) break;
-        if (e->cpython_id == cid && e->type_tag == type_tag &&
-                (type_tag == 1 || type_tag == 2 || type_tag == 3)) {
-            if (e->snapshot_fresh) {
+        if (e->cpython_id == cid && e->type_tag == type_tag) {
+            if (type_tag == 1 || type_tag == 2 || type_tag == 3) {
+                if (e->snapshot_fresh) {
+                    return e->oid;
+                }
+                wal_emit_initial_snapshot(e->oid, type_tag, obj, line);
+                e->snapshot_fresh = 1;
                 return e->oid;
             }
-            wal_emit_initial_snapshot(e->oid, type_tag, obj, line);
-            e->snapshot_fresh = 1;
+            if (type_tag == 10) {
+                /* The address may have been reused by an object of a
+                 * different class (e.g. a fresh exception instance lands
+                 * where the previous one was). Re-record the type name
+                 * so the loader's `__obj__` snapshot tracks reality. */
+                PyObject *name_obj = PyUnicode_InternFromString(
+                    Py_TYPE(obj)->tp_name);
+                if (name_obj) {
+                    e->type_name_idx = string_intern(name_obj);
+                    Py_DECREF(name_obj);
+                } else {
+                    PyErr_Clear();
+                }
+                return e->oid;
+            }
             return e->oid;
         }
     }
@@ -399,7 +442,7 @@ static inline void wal_write_value(uint8_t **p, PyObject *obj, int32_t line) {
         /* Mutable/complex object — oid reference */
         oid_t ref = oid_lookup((uintptr_t)obj);
         if (ref == OID_NONE) {
-            ref = oid_create((uintptr_t)obj, classify_type(obj));
+            ref = oid_create((uintptr_t)obj, classify_type(obj), obj);
         }
         wal_write_u8(p, 5);
         wal_write_u32(p, ref);
@@ -1626,6 +1669,35 @@ _PyWAL_GetStringTable(void)
     for (int i = 0; i < g_n_strings; i++) {
         PyObject *s = g_string_table[i];
         PyList_SET_ITEM(result, i, s ? Py_NewRef(s) : Py_NewRef(Py_None));
+    }
+    return result;
+}
+
+/* Return {oid: type_name} for every entry whose type_name was recorded.
+ * Today we only record for type_tag = 10 (user objects / functions /
+ * methods / etc) — for built-in containers the type_tag itself is
+ * sufficient. The loader uses this to render `__obj__` snapshots with
+ * the actual class name instead of a generic "object". */
+PyObject *
+_PyWAL_GetOidTypeNames(void)
+{
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+    for (int i = 0; i < OID_MAP_SIZE; i++) {
+        OidMapEntry *e = &g_oid_map[i];
+        if (!e->occupied) continue;
+        if (e->type_name_idx == UINT16_MAX) continue;
+        if (e->type_name_idx >= g_n_strings) continue;
+        PyObject *name = g_string_table[e->type_name_idx];
+        if (!name) continue;
+        PyObject *oid_key = PyLong_FromUnsignedLong(e->oid);
+        if (!oid_key) { Py_DECREF(result); return NULL; }
+        if (PyDict_SetItem(result, oid_key, name) < 0) {
+            Py_DECREF(oid_key);
+            Py_DECREF(result);
+            return NULL;
+        }
+        Py_DECREF(oid_key);
     }
     return result;
 }

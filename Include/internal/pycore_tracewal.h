@@ -58,6 +58,7 @@ extern void    _PyWAL_Stop(void);
 extern PyObject *_PyWAL_GetStats(void);
 extern PyObject *_PyWAL_GetWAL(int max_count);
 extern PyObject *_PyWAL_GetStringTable(void);
+extern PyObject *_PyWAL_GetOidTypeNames(void);
 extern void    _PyWAL_Clear(void);
 extern PyObject *_PyWAL_RegisterCode(PyObject *code_obj);
 
