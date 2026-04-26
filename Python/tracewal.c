@@ -706,6 +706,14 @@ typedef struct {
     uint16_t code_idx;
     int32_t *offset_to_line;  /* pre-computed offset→line table, NULL if not built */
     int n_offsets;             /* size of offset_to_line array */
+    /* Surgical classifier — gates BIND/UNBIND/LINE emission for stdlib code.
+     * `classified` is 0 until code_is_traceable() runs the user-supplied
+     * classifier callback; `is_traceable` is the cached result (1 = emit
+     * everything, 0 = skip BIND/UNBIND/LINE for this code). When no
+     * classifier is registered, both bits stay 0 and code_is_traceable()
+     * short-circuits to 1, so nothing changes for callers that don't opt in. */
+    uint8_t is_traceable;
+    uint8_t classified;
 } CodeAnalysis;
 
 static CodeAnalysis g_code_cache[MAX_CODE_ENTRIES];
@@ -797,6 +805,49 @@ static inline int code_get_idx(_PyInterpreterFrame *frame) {
     return idx;
 }
 
+/* User-supplied classifier callable: takes a code object, returns truthy
+ * for "user code" (full event emission) and falsy for "stdlib / non-user
+ * code" (BIND/UNBIND/LINE skipped). Set via _PyWAL_SetClassifier; NULL
+ * means everything is treated as traceable. */
+static PyObject *g_classifier = NULL;
+
+/* Lazy classification: returns 1 if `code_idx` is traceable, 0 otherwise.
+ * The first call per code_idx invokes the registered classifier (if any)
+ * and caches the result on the CodeAnalysis entry. Subsequent calls are
+ * a single branch + load — cheap enough for the hot path. */
+static inline int code_is_traceable(int code_idx) {
+    if (code_idx < 0 || code_idx >= g_n_codes) return 1;
+    CodeAnalysis *ca = &g_code_cache[code_idx];
+    if (ca->classified) return ca->is_traceable;
+    if (!g_classifier || !ca->code_ref) {
+        ca->is_traceable = 1;
+        ca->classified = 1;
+        return 1;
+    }
+    /* Disable WAL during the callback so any Python code the classifier
+     * runs doesn't recursively trigger our own hooks. The bytecode
+     * handlers all gate on _PyWAL_enabled, so toggling it here is enough.
+     * Save and restore any pending exception around the call. */
+    int saved_enabled = _PyWAL_enabled;
+    _PyWAL_enabled = 0;
+    PyObject *exc_type, *exc_val, *exc_tb;
+    PyErr_Fetch(&exc_type, &exc_val, &exc_tb);
+    PyObject *result = PyObject_CallOneArg(g_classifier, ca->code_ref);
+    int traceable = 1;
+    if (result) {
+        int truth = PyObject_IsTrue(result);
+        traceable = (truth > 0) ? 1 : 0;
+        Py_DECREF(result);
+    } else {
+        PyErr_Clear();  /* swallow classifier errors — fail open */
+    }
+    PyErr_Restore(exc_type, exc_val, exc_tb);
+    _PyWAL_enabled = saved_enabled;
+    ca->is_traceable = (uint8_t)traceable;
+    ca->classified = 1;
+    return traceable;
+}
+
 /* ========================================================================
  * Frame cache
  * ======================================================================== */
@@ -878,6 +929,10 @@ _PyWAL_CheckLine(_PyInterpreterFrame *frame)
     /* Get code_idx first so we can use the fast line lookup */
     int code_idx = code_get_idx(frame);
     if (code_idx < 0) return;
+
+    /* LINE events for non-traceable code are dropped by the loader
+     * unconditionally — skip emission entirely. */
+    if (!code_is_traceable(code_idx)) return;
 
     int32_t line = get_line_fast(code_idx, frame);
     if (line == g_last_line_num && frame == g_last_line_frame) return;
@@ -975,6 +1030,14 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
             }
         }
 
+        /* Skip arg-binding for non-traceable code — the loader drops these
+         * BINDs anyway (frame.frame_id == -1). CALL above still fires so the
+         * frame stack stays balanced and any nested user-code calls have
+         * the right parent frame chain. */
+        if (!code_is_traceable(code_idx)) {
+            return;
+        }
+
         /* Capture argument bindings */
         int n_args = ca->n_args;
         for (int i = 0; i < n_args && i < MAX_LOCALS; i++) {
@@ -1022,6 +1085,13 @@ _PyWAL_OnStoreFast(_PyInterpreterFrame *frame, int local_idx,
 
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
+
+    /* Skip BIND/UNBIND emission for non-traceable code (the loader drops
+     * them by frame.frame_id check). Also skip the bound_oids bookkeeping —
+     * the FrameCache for this frame stays at its initial zeros, OnReturn
+     * has nothing to unbind, and we never read bound_oids back from a
+     * non-traceable frame. */
+    if (!code_is_traceable(fc->code_idx)) return;
 
     int32_t line = get_line_fast(fc->code_idx, frame);
 
@@ -1323,6 +1393,10 @@ _PyWAL_OnStoreDeref(_PyInterpreterFrame *frame,
 
     FrameCache *fc = find_frame(frame);
     if (!fc) return;
+
+    /* Same gating as STORE_FAST — cell BIND/UNBIND are dropped by the
+     * loader for non-traceable frames. */
+    if (!code_is_traceable(fc->code_idx)) return;
 
     int32_t line = get_line_fast(fc->code_idx, frame);
 
@@ -1785,6 +1859,8 @@ _PyWAL_Clear(void)
     for (int i = 0; i < g_n_codes; i++) {
         PyMem_Free(g_code_cache[i].offset_to_line);
         g_code_cache[i].offset_to_line = NULL;
+        g_code_cache[i].classified = 0;
+        g_code_cache[i].is_traceable = 0;
     }
     g_n_codes = 0;
     g_n_frames = 0;
@@ -1800,6 +1876,29 @@ _PyWAL_Clear(void)
         g_string_table[i] = NULL;
     }
     string_intern_init();
+}
+
+/* Register a classifier callback. Pass None (or NULL) to clear. The
+ * callback receives a code object and returns truthy for "user code"
+ * (full event emission) or falsy for "skip BIND/UNBIND/LINE". Existing
+ * CodeAnalysis classifications are reset so the new callback runs lazily
+ * on the next event for each code object. */
+void
+_PyWAL_SetClassifier(PyObject *fn)
+{
+    PyObject *old = g_classifier;
+    if (fn == NULL || fn == Py_None) {
+        g_classifier = NULL;
+    } else {
+        Py_INCREF(fn);
+        g_classifier = fn;
+    }
+    Py_XDECREF(old);
+    /* Reset cached classifications so the new policy applies. */
+    for (int i = 0; i < g_n_codes; i++) {
+        g_code_cache[i].classified = 0;
+        g_code_cache[i].is_traceable = 0;
+    }
 }
 
 /* Return the interned string table as a Python list. The loader uses this

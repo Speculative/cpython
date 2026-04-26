@@ -61,5 +61,6 @@ extern PyObject *_PyWAL_GetStringTable(void);
 extern PyObject *_PyWAL_GetOidTypeNames(void);
 extern void    _PyWAL_Clear(void);
 extern PyObject *_PyWAL_RegisterCode(PyObject *code_obj);
+extern void    _PyWAL_SetClassifier(PyObject *fn);
 
 #endif /* !Py_INTERNAL_TRACEWAL_H */

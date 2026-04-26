@@ -78,6 +78,21 @@ tracewal_get_oid_type_names(PyObject *self, PyObject *Py_UNUSED(ignored))
 }
 
 static PyObject *
+tracewal_set_classifier(PyObject *self, PyObject *arg)
+{
+    /* Accept None or a callable. The callable receives a code object
+     * and returns truthy for "user code" (full event emission) or
+     * falsy for "skip BIND/UNBIND/LINE". */
+    if (arg != Py_None && !PyCallable_Check(arg)) {
+        PyErr_SetString(PyExc_TypeError,
+                        "set_classifier requires a callable or None");
+        return NULL;
+    }
+    _PyWAL_SetClassifier(arg);
+    Py_RETURN_NONE;
+}
+
+static PyObject *
 tracewal_register_code(PyObject *self, PyObject *args)
 {
     /* Compatibility with _ctrace_wal's register_code(code, first_line, line_data, strings).
@@ -96,6 +111,10 @@ tracewal_register_code(PyObject *self, PyObject *args)
 static PyMethodDef methods[] = {
     {"register_code", tracewal_register_code, METH_VARARGS,
      "Register code object (compatibility — fork auto-registers)."},
+    {"set_classifier", tracewal_set_classifier, METH_O,
+     "Register a code-object classifier. Pass None to clear. "
+     "The callable receives a code object and returns truthy for "
+     "user code (full events) or falsy to skip BIND/UNBIND/LINE."},
     {"start", (PyCFunction)tracewal_start, METH_VARARGS | METH_KEYWORDS,
      "Start WAL tracing. Args: buf_size=64MB, output_file=None."},
     {"stop", tracewal_stop, METH_NOARGS,
