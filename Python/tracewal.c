@@ -257,6 +257,9 @@ static oid_t oid_get_or_create_for_mutation(PyObject *obj, int32_t line) {
         if (!e->occupied) break;
         if (e->cpython_id == cid) {
             if (e->type_tag == type_tag) {
+                /* Tuples are immutable — for_mutation is never called on
+                 * them in practice, but invalidate defensively for symmetry
+                 * with oid_get_or_create's freelist-window guard. */
                 if (type_tag == 4 /* tuple */) {
                     e->occupied = 0;
                     if (g_oid_map_count) g_oid_map_count--;
@@ -311,10 +314,15 @@ static oid_t oid_get_or_create(PyObject *obj, int32_t line) {
         if (!e->occupied) break;
         if (e->cpython_id == cid) {
             if (e->type_tag == type_tag) {
-                /* For immutable types (tuples, frozensets), id reuse is
-                 * indistinguishable from same object — but since we removed
-                 * oid invalidation on return, a freed tuple's id can be reused
-                 * by a new tuple with different contents. Force a new oid. */
+                /* Tuples: still invalidate-on-lookup. The _Py_Dealloc hook
+                 * catches most freed-tuple cases up front, but there's a
+                 * timing window where a tuple is freed via the small-tuple
+                 * freelist (memory cached, not actually returned to the
+                 * allocator) and a *new* tuple at the same address is
+                 * looked up before the original dealloc completes. Treating
+                 * tuple-on-tuple address matches as fresh covers that
+                 * window for free; correctness is unaffected for genuine
+                 * same-object lookups since tuple contents are immutable. */
                 if (type_tag == 4 /* tuple */) {
                     e->occupied = 0;
                     if (g_oid_map_count) g_oid_map_count--;
@@ -376,11 +384,11 @@ static oid_t oid_get_or_create_refresh(PyObject *obj, int32_t line) {
                  * events; full OBJ_SNAPSHOT refresh isn't required. */
                 return e->oid;
             }
-            /* Other matchable types (notably tuple, type_tag = 4) are
-             * immutable and the address can be reused for a different
-             * tuple with the same length but different contents. Fall
-             * through to oid_get_or_create, which invalidates the entry
-             * and allocates a fresh oid. */
+            /* Other matchable types (notably tuple, type_tag = 4): the
+             * cached entry is valid because the dealloc hook invalidates
+             * on free, so an address reuse always lands as a miss above.
+             * Fall through anyway — this branch is kept for defensive
+             * symmetry with oid_get_or_create's same-type return. */
             break;
         }
     }

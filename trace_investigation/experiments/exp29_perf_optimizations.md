@@ -22,7 +22,7 @@ should be re-checked when actually doing the work.
 | 1 | Resizable oid_map | Removes a sharp cliff | ~40 LoC | Hash table refactor | Low | **next** |
 | 2a | Surgical classifier (BIND/UNBIND/LINE only, CALL/RETURN/mutations always emit) | ~5% TOTAL bench, up to ~40% on stdlib-heavy workloads | ~120 LoC fork + ~60 LoC bootstrap | Per-code tag + Python callback hook + 4 hook gates | Low | **landed** |
 | 2b | Complete classifier (also skip CALL/RETURN, plus oid-visibility-gated mutations) | ~5-10x WAL volume | adds ~150 LoC loader + ~50 LoC reference/test plumbing | Loader frame-stack rework + reference-tracer mirror filter | Medium | post-demo |
-| 3 | tp_dealloc hooks | ~2x runtime + bounds map memory | ~80-150 LoC | Patches CPython type slots | High | post-demo |
+| 3 | tp_dealloc hooks (via `_Py_Dealloc` funnel) | Closes same-class user-object pollution; bounds map memory | ~10 LoC | One call site in `_Py_Dealloc` | Low | **landed** |
 | 4 | Compact event encoding | ~2-3x smaller WAL | ~100 LoC | Touches every emit + every parser | Medium | post-demo |
 | 5 | Streaming compression | ~3-5x smaller WAL | ~50 LoC | flush path + reader | Medium-Low | post-demo |
 | 6 | Skip BIND for unchanged primitives | Modest | ~20 LoC | One hook | Very low | post-demo |
@@ -292,7 +292,28 @@ When we come back for the full version, the unfinished pieces are:
    only if real captures still have noisy mutation events on
    stdlib-only objects after CALL/RETURN skipping.
 
-## 3. tp_dealloc hooks  *(post-demo)*
+## 3. tp_dealloc hooks  *(landed via `_Py_Dealloc` instead — see exp30)*
+
+**Status (2026-04-27):** done, but not via the slot-patching shape
+described below. Slot-patching `tp_dealloc` per type was attempted
+first and abandoned — too many failure modes (custom C-extension
+destructors, weakref subclasses, inheritance via `subtype_dealloc`).
+What landed instead: a single hook in `Objects/object.c::_Py_Dealloc`,
+gated on `_PyWAL_enabled`, that calls `_PyWAL_OnObjectDealloc(op)` →
+`oid_invalidate` before the type's own `tp_dealloc` runs. Universal
+funnel: every refcount-driven AND GC-driven dispatch passes through.
+Hook is at the top of the function so trashcan-deferred deallocs also
+invalidate. ~3 LoC in object.c + ~5 LoC in tracewal.c, replaced ~80
+LoC of slot-patching attempts. See
+[`exp30_dealloc_hooks_user_types.md`](./exp30_dealloc_hooks_user_types.md)
+for the failure analysis from the slot-patching attempt and the
+lesson learned ("hook the common path, not N type slots").
+
+The original slot-patching analysis below is preserved as historical
+reference and so the failure-mode catalog isn't lost.
+
+---
+
 
 **Idea.** At trace start, replace `tp_dealloc` for tracked types
 (PyList_Type, PyDict_Type, PySet_Type, PyTuple_Type, type-tag-10

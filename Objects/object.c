@@ -3271,6 +3271,15 @@ stack is shallower */
 void
 _Py_Dealloc(PyObject *op)
 {
+    /* Universal oid_map invalidation hook — at the top of the function so
+     * trashcan-deferred deallocs (deep-recursion path that early-returns
+     * after enqueueing) still see invalidation. Otherwise the deferred
+     * dealloc happens after subsequent allocations may have reused the
+     * address, leaving stale entries that produce wrong-oid binds. Gated
+     * on _PyWAL_enabled so cost is one branch when tracing is off. */
+    if (_PyWAL_enabled) {
+        _PyWAL_OnObjectDealloc(op);
+    }
     PyTypeObject *type = Py_TYPE(op);
     unsigned long gc_flag = type->tp_flags & Py_TPFLAGS_HAVE_GC;
     destructor dealloc = type->tp_dealloc;
@@ -3279,12 +3288,6 @@ _Py_Dealloc(PyObject *op)
     if (margin < 2 && gc_flag) {
         _PyTrash_thread_deposit_object(tstate, (PyObject *)op);
         return;
-    }
-    /* Universal oid_map invalidation hook — gated on _PyWAL_enabled so the
-     * cost is one branch when tracing is off. When on, oid_invalidate's
-     * fast path (no map → return) keeps the miss case cheap. */
-    if (_PyWAL_enabled) {
-        _PyWAL_OnObjectDealloc(op);
     }
 #ifdef Py_DEBUG
 #if !defined(Py_GIL_DISABLED) && !defined(Py_STACKREF_DEBUG)
