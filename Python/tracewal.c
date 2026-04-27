@@ -1021,6 +1021,16 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
         int32_t line = get_line_fast(code_idx, frame);
         fc->last_line = line;
 
+        /* Skip CALL emission AND arg-binding for non-traceable code (full
+         * classifier — exp29 #2b). FrameCache push above still happens so
+         * mutations (SETITEM/SETATTR/MUTATE) emitted from inside stdlib
+         * via find_frame still work; only the CALL/BIND row volume is
+         * suppressed. The loader's frame stack only ever sees user
+         * frames now, simplifying parent_frame_id resolution. */
+        if (!code_is_traceable(code_idx)) {
+            return;
+        }
+
         /* Emit CALL */
         {
             uint8_t *p = wal_reserve(15);
@@ -1028,14 +1038,6 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
                 wal_write_header(&p, WAL_CALL, 0, line, (uint16_t)code_idx);
                 wal_finish(p);
             }
-        }
-
-        /* Skip arg-binding for non-traceable code — the loader drops these
-         * BINDs anyway (frame.frame_id == -1). CALL above still fires so the
-         * frame stack stays balanced and any nested user-code calls have
-         * the right parent frame chain. */
-        if (!code_is_traceable(code_idx)) {
-            return;
         }
 
         /* Capture argument bindings */
@@ -1299,22 +1301,25 @@ _PyWAL_OnReturn(_PyInterpreterFrame *frame, PyObject *retval)
         }
     }
 
-    /* Emit RETURN with return value. Use the refresh variant: a returned
-     * value crosses a frame boundary and might land in a caller's slot
-     * whose previous occupant was at the same address — a snapshot here
-     * makes sure the loader sees the current contents. */
+    /* Emit RETURN with return value. Skip emission for non-traceable code
+     * (complete classifier — exp29 #2b); the refresh on retval still runs
+     * so any container that crosses back into traceable code has a fresh
+     * snapshot waiting at the caller's STORE_FAST. pop_frame still fires
+     * unconditionally to keep FrameCache balanced for mutations. */
     if (retval && !is_primitive(retval)) {
         oid_get_or_create_refresh(retval, line);
     }
-    uint8_t *p = wal_reserve(WAL_MAX_ENTRY_SIZE);
-    if (p) {
-        wal_write_header(&p, WAL_RETURN, 0, line, (uint16_t)code_idx);
-        if (retval) {
-            wal_write_value(&p, retval, line);
-        } else {
-            wal_write_u8(&p, 0);
+    if (code_is_traceable(code_idx)) {
+        uint8_t *p = wal_reserve(WAL_MAX_ENTRY_SIZE);
+        if (p) {
+            wal_write_header(&p, WAL_RETURN, 0, line, (uint16_t)code_idx);
+            if (retval) {
+                wal_write_value(&p, retval, line);
+            } else {
+                wal_write_u8(&p, 0);
+            }
+            wal_finish(p);
         }
-        wal_finish(p);
     }
 
     pop_frame(frame);
@@ -1330,19 +1335,22 @@ _PyWAL_OnYield(_PyInterpreterFrame *frame, PyObject *retval)
 
     int32_t line = get_line_fast(fc->code_idx, frame);
 
-    /* Emit RETURN event for yield (frame stays alive, no unbind) */
+    /* Emit yield-as-RETURN — gated on traceability for the complete
+     * classifier (exp29 #2b). Stdlib generators don't surface in the trace. */
     if (retval && !is_primitive(retval)) {
         oid_get_or_create(retval, line);
     }
-    uint8_t *p = wal_reserve(WAL_MAX_ENTRY_SIZE);
-    if (p) {
-        wal_write_header(&p, WAL_RETURN, 0, line, (uint16_t)fc->code_idx);
-        if (retval) {
-            wal_write_value(&p, retval, line);
-        } else {
-            wal_write_u8(&p, 0);
+    if (code_is_traceable(fc->code_idx)) {
+        uint8_t *p = wal_reserve(WAL_MAX_ENTRY_SIZE);
+        if (p) {
+            wal_write_header(&p, WAL_RETURN, 0, line, (uint16_t)fc->code_idx);
+            if (retval) {
+                wal_write_value(&p, retval, line);
+            } else {
+                wal_write_u8(&p, 0);
+            }
+            wal_finish(p);
         }
-        wal_finish(p);
     }
 }
 

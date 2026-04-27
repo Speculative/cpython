@@ -98,18 +98,64 @@ def build_configs(cext=False, stores=False):
     # dropping events and skewing measurements.
     _wal_output = '/dev/null'
 
+    # Build a path-based classifier matching the real capture pipeline
+    # (autopsy_report/capture/_child_bootstrap.py:_build_default_classifier).
+    # The bench's workload module lives outside stdlib/site-packages and is
+    # the only "user" code; everything stdlib/frozen is non-user. Without a
+    # classifier the fork emits CALL/RETURN/BIND for every frame including
+    # stdlib internals, so the demo's actual perf shape isn't represented.
+    import os as _os
+    import site as _site
+    _stdlib_dir = _os.path.abspath(_os.path.dirname(_os.__file__))
+    _site_dirs = []
+    try:
+        _site_dirs.extend(_site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        _us = _site.getusersitepackages()
+        if _us:
+            _site_dirs.append(_us)
+    except Exception:
+        pass
+    _site_dirs = [_os.path.abspath(d) for d in _site_dirs if d]
+    _abscache: dict = {}
+
+    def _is_user(code):
+        path = code.co_filename
+        if not path or (path[:1] == '<' and path[-1:] == '>'):
+            return False
+        ap = _abscache.get(path)
+        if ap is None:
+            ap = _os.path.abspath(path)
+            _abscache[path] = ap
+        if _stdlib_dir and ap.startswith(_stdlib_dir):
+            return False
+        for sp in _site_dirs:
+            if ap.startswith(sp):
+                return False
+        return True
+
+    def _start_fork(line_mode):
+        _tracewal.set_classifier(_is_user)
+        _tracewal.start(line_mode=line_mode, output_file=_wal_output)
+
+    def _stop_fork():
+        _tracewal.stop()
+        _tracewal.set_classifier(None)
+
     configs = [
         ('baseline', 'Baseline', lambda: None, lambda: None),
     ]
 
     if stores:
         configs.append(('fork_m0', 'Fork stores',
-                        lambda: _tracewal.start(line_mode=0, output_file=_wal_output),
-                        lambda: _tracewal.stop()))
+                        lambda: _start_fork(0),
+                        _stop_fork))
 
     configs.append(('fork_m1', 'Fork ctrl',
-                    lambda: _tracewal.start(line_mode=1, output_file=_wal_output),
-                    lambda: _tracewal.stop()))
+                    lambda: _start_fork(1),
+                    _stop_fork))
 
     if cext:
         try:

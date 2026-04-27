@@ -21,7 +21,7 @@ should be re-checked when actually doing the work.
 |---|---|---|---|---|---|---|
 | 1 | Resizable oid_map | Removes a sharp cliff | ~40 LoC | Hash table refactor | Low | **next** |
 | 2a | Surgical classifier (BIND/UNBIND/LINE only, CALL/RETURN/mutations always emit) | ~5% TOTAL bench, up to ~40% on stdlib-heavy workloads | ~120 LoC fork + ~60 LoC bootstrap | Per-code tag + Python callback hook + 4 hook gates | Low | **landed** |
-| 2b | Complete classifier (also skip CALL/RETURN, plus oid-visibility-gated mutations) | ~5-10x WAL volume | adds ~150 LoC loader + ~50 LoC reference/test plumbing | Loader frame-stack rework + reference-tracer mirror filter | Medium | post-demo |
+| 2b | Complete classifier (also skip CALL/RETURN — oid-visibility mutation gating still deferred) | ~24% smaller WAL on demo capture (731KB → 559KB on order_pipeline.atrace); negligible on workloads_large.py because those are self-contained user code | ~30 LoC fork + ~10 LoC loader (RAISE-handler guard) + ~30 LoC reference tracer (classifier param) | Required: gate CALL/RETURN/yield-RETURN, skip RAISEs whose code_idx isn't on user-only stack, classifier-aware reference tracer | Low | **landed** |
 | 3 | tp_dealloc hooks (via `_Py_Dealloc` funnel) | Closes same-class user-object pollution; bounds map memory | ~10 LoC | One call site in `_Py_Dealloc` | Low | **landed** |
 | 4 | Compact event encoding | ~2-3x smaller WAL | ~100 LoC | Touches every emit + every parser | Medium | post-demo |
 | 5 | Streaming compression | ~3-5x smaller WAL | ~50 LoC | flush path + reader | Medium-Low | post-demo |
@@ -115,36 +115,42 @@ async_prodcons 1.76x → ~1.0x, io_json 2.38x → 1.7x, stress_oid_churn
 2.53x → 1.4x, async_network 1.98x → 1.6x. Pure-user-code workloads
 sit within noise; no consistent regression across runs.
 
-**What's still left for the full job (#2b).** The surgical version
-buys us cheap WAL skipping but doesn't buy back the larger gains on
-the table. Three deferred pieces, each requires loader work:
+**What's still left for the full job (#2b).**
 
-1. **Skip CALL/RETURN for non-traceable code** — biggest WAL volume
-   win. The loader currently tracks a full nesting frame stack
-   (used for parent_frame_id wiring and RETURN unwinding); without
-   stdlib CALL/RETURN, that stack falls out of balance. Loader needs
-   to maintain frame-stack consistency from user-code-only events,
-   probably via "RETURN of a code_idx not currently on top of stack
-   means an unseen stdlib RETURN happened — pop until we match" logic
-   like the existing generator-RETURN handling.
+1. ~~Skip CALL/RETURN for non-traceable code~~ — **landed
+   2026-04-27**. Fork-side gate added in `_PyWAL_OnResume`,
+   `_PyWAL_OnReturn`, `_PyWAL_OnYield`. FrameCache push/pop still
+   fires for non-traceable frames so mutations from inside stdlib
+   can still find the frame; only CALL/RETURN row emission is
+   suppressed. Loader needed one targeted fix: the EVENT_RAISE
+   handler unwinds frames whose code_idx doesn't match — with
+   stdlib CALL/RETURN gone but RAISE/EXCEPT still firing for
+   stdlib, a stdlib RAISE arriving with a code_idx not on the
+   user-only stack would unwind user frames it shouldn't. Added
+   an "if not on stack: continue" guard at the top of the RAISE
+   handler. The existing generator-RETURN orphan-handling logic
+   covered the rest of the missing-frame cases for free.
 
-2. **Mirror the classifier in the settrace reference tracer** — once
-   we drop CALL/RETURN at capture time, the reference (which still
-   sees everything) and the loaded fork trace will diverge. The
-   reference tracer needs the same code-object classifier so its
-   captured events line up apples-to-apples.
+2. ~~Mirror the classifier in the settrace reference tracer~~ —
+   **landed 2026-04-27**. `trace_callable` accepts a `classifier`
+   param; on settrace's 'call' event, returning None for a
+   non-classifier frame disables tracing for that frame
+   (subframes still call the global trace function). Wired
+   through `tests/test_differential.py`. `p16_cross_frame_mutation`
+   came out of `SKIP_EQUALITY` — the loader and reference now
+   line up on stdlib-touching workloads.
 
-3. **Oid-visibility-gated mutations** — even with classifier, today's
-   surgical version emits SETITEM on a list that was created and lives
-   entirely inside stdlib (for example, json's internal scratch
-   buffers). The loader applies these to objects the user can never
-   see. Gating mutation emission on an `is_user_visible:1` bit on
-   `OidMapEntry` (set when the oid is bound in user code or appears
-   in a user-visible container's contents) eliminates that. More
-   correctness risk — propagation has edge cases (a user object
-   containing a stdlib-created list, etc.) — so gate this on
-   measurement: if surgical+full-skip already gets us to "tracing is
-   cheap" demo claims, defer indefinitely.
+3. **Oid-visibility-gated mutations** *(still deferred)*. Even
+   with the classifier, surgical+full-skip emits SETITEM on lists
+   that live entirely inside stdlib (json scratch buffers etc).
+   The loader applies them to objects the user can never see.
+   Gating mutation emission on an `is_user_visible:1` bit on
+   `OidMapEntry` (set when the oid is bound in user code or
+   appears in a user-visible container's contents) eliminates
+   that. More correctness risk — propagation has edge cases (a
+   user object containing a stdlib-created list, etc.). Defer
+   until a real capture's WAL profile shows it's worth it; the
+   demo capture is already 24% smaller post-#2b without this.
 
 The original design notes follow.
 
