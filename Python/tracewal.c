@@ -462,13 +462,42 @@ static inline void wal_write_i32(uint8_t **p, int32_t v) { memcpy(*p, &v, 4); *p
 static inline void wal_write_i64(uint8_t **p, int64_t v) { memcpy(*p, &v, 8); *p += 8; }
 static inline void wal_write_f64(uint8_t **p, double v) { memcpy(*p, &v, 8); *p += 8; }
 
+/* Variable-length integer encoders (uleb128 / zigzag-uleb128). Used to
+ * compress the per-event header and small body indices. Most fields we
+ * encode are bounded well under 1 byte's worth of value-bits, so this
+ * cuts header overhead from a fixed 15 bytes to typically 5-9 bytes. */
+static inline void wal_write_uvarint(uint8_t **p, uint64_t v) {
+    while (v >= 0x80) {
+        **p = (uint8_t)(v | 0x80);
+        (*p)++;
+        v >>= 7;
+    }
+    **p = (uint8_t)v;
+    (*p)++;
+}
+static inline void wal_write_svarint(uint8_t **p, int64_t v) {
+    /* Zigzag: -1→1, 0→0, 1→2, -2→3, ... so small magnitudes regardless
+     * of sign use few bytes. Then standard uleb128. */
+    uint64_t zz = ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+    wal_write_uvarint(p, zz);
+}
+
+/* Worst-case header size: 1 (event) + 5 (delta_seq) + 5 (oid varint) +
+ * 5 (line zigzag varint) + 5 (code_idx varint) = 21 bytes. Reserves
+ * upstream pad to this; actual writes are typically 5-9 bytes. */
+#define WAL_HEADER_MAX 21
+
 static inline void wal_write_header(uint8_t **p, uint8_t event, oid_t oid,
                                      int32_t line, uint16_t code_idx) {
     wal_write_u8(p, event);
-    wal_write_u32(p, ++g_wal_seq);
-    wal_write_u32(p, oid);
-    wal_write_i32(p, line);
-    wal_write_u16(p, code_idx);
+    /* seq is delta-encoded — every event increments g_wal_seq by 1, so
+     * the delta is always 1 (one byte of varint) in normal emission.
+     * The reader rebuilds the absolute seq by accumulating deltas. */
+    g_wal_seq++;
+    wal_write_uvarint(p, 1);
+    wal_write_uvarint(p, oid);
+    wal_write_svarint(p, line);
+    wal_write_uvarint(p, code_idx);
     g_wal_total++;
 }
 
@@ -487,7 +516,8 @@ static inline void wal_write_value(uint8_t **p, PyObject *obj, int32_t line) {
             wal_write_u8(p, 6);
         } else {
             wal_write_u8(p, 1);
-            wal_write_i64(p, (int64_t)v);
+            /* Zigzag varint — most ints in trace values are small. */
+            wal_write_svarint(p, (int64_t)v);
         }
     } else if (PyFloat_Check(obj)) {
         wal_write_u8(p, 2);
@@ -518,12 +548,12 @@ static inline void wal_write_value(uint8_t **p, PyObject *obj, int32_t line) {
             ref = oid_create((uintptr_t)obj, classify_type(obj), obj);
         }
         wal_write_u8(p, 5);
-        wal_write_u32(p, ref);
+        wal_write_uvarint(p, ref);
     }
 }
 
 static void wal_emit_create(oid_t oid, uint8_t type_tag, int32_t line) {
-    uint8_t *p = wal_reserve(15 + 1);
+    uint8_t *p = wal_reserve(WAL_HEADER_MAX + 1);
     if (!p) return;
     wal_write_header(&p, WAL_CREATE, oid, line, 0);
     wal_write_u8(&p, type_tag);
@@ -553,10 +583,10 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
                 oid_get_or_create(item, line);
             }
         }
-        uint8_t *p = wal_reserve(15 + 2 + n * 14);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + n * 14);
         if (p) {
             wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
-            wal_write_u16(&p, (uint16_t)n);
+            wal_write_uvarint(&p, (uint16_t)n);
             for (Py_ssize_t i = 0; i < n; i++) {
                 wal_write_value(&p, PyList_GET_ITEM(obj, i), line);
             }
@@ -574,10 +604,10 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
             if (val && !is_primitive(val)) oid_get_or_create(val, line);
         }
         /* Each key-value pair can be up to 2*65 bytes (two strings) + 2 tags */
-        uint8_t *p = wal_reserve(15 + 2 + pairs * 140);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + pairs * 140);
         if (p) {
             wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
-            wal_write_u16(&p, (uint16_t)(pairs * 2));
+            wal_write_uvarint(&p, (uint16_t)(pairs * 2));
             Py_ssize_t n = 0;
             pos = 0;
             while (PyDict_Next(obj, &pos, &key, &val) && n < pairs) {
@@ -597,10 +627,10 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
                 items[n++] = item;
             }
             Py_DECREF(iter);
-            uint8_t *p = wal_reserve(15 + 2 + n * 14);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + n * 14);
             if (p) {
                 wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
-                wal_write_u16(&p, (uint16_t)n);
+                wal_write_uvarint(&p, (uint16_t)n);
                 for (Py_ssize_t i = 0; i < n; i++) {
                     wal_write_value(&p, items[i], line);
                     Py_DECREF(items[i]);
@@ -617,10 +647,10 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
             PyObject *item = PyTuple_GET_ITEM(obj, i);
             if (item && !is_primitive(item)) oid_get_or_create(item, line);
         }
-        uint8_t *p = wal_reserve(15 + 2 + n * 14);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + n * 14);
         if (p) {
             wal_write_header(&p, WAL_SNAPSHOT, oid, line, 0);
-            wal_write_u16(&p, (uint16_t)n);
+            wal_write_uvarint(&p, (uint16_t)n);
             for (Py_ssize_t i = 0; i < n; i++) {
                 wal_write_value(&p, PyTuple_GET_ITEM(obj, i), line);
             }
@@ -658,19 +688,19 @@ static void wal_emit_initial_snapshot(oid_t oid, uint8_t type_tag,
             PyErr_Clear();
         }
         /* Header + type_idx + n + n × (attr_idx u16 + value tag+payload). */
-        uint8_t *p = wal_reserve(15 + 2 + 2 + n * (2 + 82));
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + 3 + n * (3 + 82));
         if (p) {
             wal_write_header(&p, WAL_OBJ_SNAPSHOT, oid, line, 0);
-            wal_write_u16(&p, type_name_idx);
-            wal_write_u16(&p, (uint16_t)n);
+            wal_write_uvarint(&p, type_name_idx);
+            wal_write_uvarint(&p, (uint16_t)n);
             if (n > 0) {
                 PyObject *key, *val;
                 Py_ssize_t pos = 0, count = 0;
                 while (PyDict_Next(dict, &pos, &key, &val) && count < n) {
                     if (PyUnicode_Check(key)) {
-                        wal_write_u16(&p, string_intern(key));
+                        wal_write_uvarint(&p, string_intern(key));
                     } else {
-                        wal_write_u16(&p, 0);
+                        wal_write_uvarint(&p, 0);
                     }
                     wal_write_value(&p, val, line);
                     count++;
@@ -941,7 +971,7 @@ _PyWAL_CheckLine(_PyInterpreterFrame *frame)
     g_last_line_num = line;
     g_last_line_frame = frame;
 
-    uint8_t *p = wal_reserve(15);
+    uint8_t *p = wal_reserve(WAL_HEADER_MAX);
     if (p) {
         wal_write_header(&p, WAL_LINE, 0, line, (uint16_t)code_idx);
         wal_finish(p);
@@ -952,7 +982,7 @@ _PyWAL_CheckLine(_PyInterpreterFrame *frame)
 static inline void maybe_emit_line(FrameCache *fc, _PyInterpreterFrame *frame,
                                     int32_t line) {
     if (line != fc->last_line && line > 0) {
-        uint8_t *p = wal_reserve(15);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX);
         if (p) {
             wal_write_header(&p, WAL_LINE, 0, line,
                              (uint16_t)fc->code_idx);
@@ -1033,7 +1063,7 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
 
         /* Emit CALL */
         {
-            uint8_t *p = wal_reserve(15);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX);
             if (p) {
                 wal_write_header(&p, WAL_CALL, 0, line, (uint16_t)code_idx);
                 wal_finish(p);
@@ -1049,20 +1079,20 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
 
             if (is_primitive(val)) {
                 /* Primitive: emit BIND with inline value */
-                uint8_t *p = wal_reserve(15 + 2 + 82);
+                uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + 82);
                 if (p) {
                     wal_write_header(&p, WAL_BIND, OID_NONE, line, (uint16_t)code_idx);
-                    wal_write_u16(&p, (uint16_t)i);
+                    wal_write_uvarint(&p, (uint16_t)i);
                     wal_write_value(&p, val, line);
                     wal_finish(p);
                 }
             } else {
                 oid_t oid = oid_get_or_create_refresh(val, line);
                 fc->bound_oids[i] = oid;
-                uint8_t *p = wal_reserve(15 + 2);
+                uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
                 if (p) {
                     wal_write_header(&p, WAL_BIND, oid, line, (uint16_t)code_idx);
-                    wal_write_u16(&p, (uint16_t)i);
+                    wal_write_uvarint(&p, (uint16_t)i);
                     wal_finish(p);
                 }
             }
@@ -1109,20 +1139,20 @@ _PyWAL_OnStoreFast(_PyInterpreterFrame *frame, int local_idx,
     if (is_primitive(new_obj)) {
         /* Unbind old if present */
         if (old_oid != OID_NONE) {
-            uint8_t *p = wal_reserve(15 + 2);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
             if (p) {
                 wal_write_header(&p, WAL_UNBIND, old_oid, line,
                                  (uint16_t)fc->code_idx);
-                wal_write_u16(&p, (uint16_t)local_idx);
+                wal_write_uvarint(&p, (uint16_t)local_idx);
                 wal_finish(p);
             }
         }
         /* Primitive bind with inline value */
-        uint8_t *p = wal_reserve(15 + 2 + 82);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + 82);
         if (p) {
             wal_write_header(&p, WAL_BIND, OID_NONE, line,
                              (uint16_t)fc->code_idx);
-            wal_write_u16(&p, (uint16_t)local_idx);
+            wal_write_uvarint(&p, (uint16_t)local_idx);
             wal_write_value(&p, new_obj, line);
             wal_finish(p);
         }
@@ -1131,21 +1161,21 @@ _PyWAL_OnStoreFast(_PyInterpreterFrame *frame, int local_idx,
         oid_t new_oid = oid_get_or_create_refresh(new_obj, line);
 
         if (old_oid != OID_NONE && old_oid != new_oid) {
-            uint8_t *p = wal_reserve(15 + 2);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
             if (p) {
                 wal_write_header(&p, WAL_UNBIND, old_oid, line,
                                  (uint16_t)fc->code_idx);
-                wal_write_u16(&p, (uint16_t)local_idx);
+                wal_write_uvarint(&p, (uint16_t)local_idx);
                 wal_finish(p);
             }
         }
 
         if (new_oid != old_oid) {
-            uint8_t *p = wal_reserve(15 + 2);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
             if (p) {
                 wal_write_header(&p, WAL_BIND, new_oid, line,
                                  (uint16_t)fc->code_idx);
-                wal_write_u16(&p, (uint16_t)local_idx);
+                wal_write_uvarint(&p, (uint16_t)local_idx);
                 wal_finish(p);
             }
         }
@@ -1216,7 +1246,7 @@ _PyWAL_OnStoreAttr(_PyInterpreterFrame *frame,
     if (p) {
         wal_write_header(&p, WAL_SETATTR, owner_oid, line,
                          (uint16_t)fc->code_idx);
-        wal_write_u16(&p, name_idx);
+        wal_write_uvarint(&p, name_idx);
         wal_write_value(&p, value, line);
         wal_finish(p);
     }
@@ -1261,11 +1291,11 @@ _PyWAL_OnDeleteAttr(_PyInterpreterFrame *frame,
 
     uint16_t name_idx = string_intern(name);
 
-    uint8_t *p = wal_reserve(15 + 2);
+    uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
     if (p) {
         wal_write_header(&p, WAL_DELATTR, owner_oid, line,
                          (uint16_t)fc->code_idx);
-        wal_write_u16(&p, name_idx);
+        wal_write_uvarint(&p, name_idx);
         wal_finish(p);
     }
 }
@@ -1287,11 +1317,11 @@ _PyWAL_OnReturn(_PyInterpreterFrame *frame, PyObject *retval)
     int n_locals = code->co_nlocals;
     for (int i = 0; i < n_locals && i < MAX_LOCALS; i++) {
         if (fc->bound_oids[i] != OID_NONE) {
-            uint8_t *p = wal_reserve(15 + 2);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
             if (p) {
                 wal_write_header(&p, WAL_UNBIND, fc->bound_oids[i], line,
                                  (uint16_t)code_idx);
-                wal_write_u16(&p, (uint16_t)i);
+                wal_write_uvarint(&p, (uint16_t)i);
                 wal_finish(p);
             }
             /* Note: we do NOT invalidate oids here. The objects may still
@@ -1387,7 +1417,7 @@ _PyWAL_OnStoreGlobal(_PyInterpreterFrame *frame,
     if (p) {
         wal_write_header(&p, WAL_SETATTR, dict_oid, line,
                          (uint16_t)fc->code_idx);
-        wal_write_u16(&p, name_idx);
+        wal_write_uvarint(&p, name_idx);
         wal_write_value(&p, value, line);
         wal_finish(p);
     }
@@ -1421,14 +1451,14 @@ _PyWAL_OnStoreDeref(_PyInterpreterFrame *frame,
 
     /* Emit as BIND — the cell variable is conceptually a variable binding */
     if (is_primitive(value)) {
-        uint8_t *p = wal_reserve(15 + 2 + 82);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + 82);
         if (p) {
             wal_write_header(&p, WAL_BIND, OID_NONE, line,
                              (uint16_t)fc->code_idx);
             /* Use cell_idx as the name index — but we need the name in the WAL.
              * We'll intern the name and write it as a u16. */
             PyObject *nm = PyTuple_GET_ITEM(code->co_localsplusnames, cell_idx);
-            wal_write_u16(&p, (uint16_t)cell_idx);
+            wal_write_uvarint(&p, (uint16_t)cell_idx);
             wal_write_value(&p, value, line);
             wal_finish(p);
         }
@@ -1437,20 +1467,20 @@ _PyWAL_OnStoreDeref(_PyInterpreterFrame *frame,
         oid_t old_oid = (cell_idx < MAX_LOCALS) ? fc->bound_oids[cell_idx] : OID_NONE;
 
         if (old_oid != OID_NONE && old_oid != new_oid) {
-            uint8_t *p = wal_reserve(15 + 2);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
             if (p) {
                 wal_write_header(&p, WAL_UNBIND, old_oid, line,
                                  (uint16_t)fc->code_idx);
-                wal_write_u16(&p, (uint16_t)cell_idx);
+                wal_write_uvarint(&p, (uint16_t)cell_idx);
                 wal_finish(p);
             }
         }
         if (new_oid != old_oid) {
-            uint8_t *p = wal_reserve(15 + 2);
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3);
             if (p) {
                 wal_write_header(&p, WAL_BIND, new_oid, line,
                                  (uint16_t)fc->code_idx);
-                wal_write_u16(&p, (uint16_t)cell_idx);
+                wal_write_uvarint(&p, (uint16_t)cell_idx);
                 wal_finish(p);
             }
         }
@@ -1506,10 +1536,10 @@ static void emit_snapshot(oid_t oid, PyObject *obj, int32_t line, uint16_t code_
             }
         }
 
-        uint8_t *p = wal_reserve(15 + 2 + n * 14);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + n * 14);
         if (p) {
             wal_write_header(&p, WAL_SNAPSHOT, oid, line, code_idx);
-            wal_write_u16(&p, (uint16_t)n);
+            wal_write_uvarint(&p, (uint16_t)n);
             for (Py_ssize_t i = 0; i < n; i++) {
                 wal_write_value(&p, PyList_GET_ITEM(obj, i), line);
             }
@@ -1535,10 +1565,10 @@ static void emit_snapshot(oid_t oid, PyObject *obj, int32_t line, uint16_t code_
         }
         Py_DECREF(iter);
 
-        uint8_t *p = wal_reserve(15 + 2 + count * 14);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + count * 14);
         if (p) {
             wal_write_header(&p, WAL_SNAPSHOT, oid, line, code_idx);
-            wal_write_u16(&p, (uint16_t)count);
+            wal_write_uvarint(&p, (uint16_t)count);
             for (Py_ssize_t i = 0; i < count; i++) {
                 wal_write_value(&p, items[i], line);
                 Py_DECREF(items[i]);
@@ -1562,10 +1592,10 @@ static void emit_snapshot(oid_t oid, PyObject *obj, int32_t line, uint16_t code_
             }
         }
 
-        uint8_t *p = wal_reserve(15 + 2 + n * 14);
+        uint8_t *p = wal_reserve(WAL_HEADER_MAX + 3 + n * 14);
         if (p) {
             wal_write_header(&p, WAL_SNAPSHOT, oid, line, code_idx);
-            wal_write_u16(&p, (uint16_t)n);
+            wal_write_uvarint(&p, (uint16_t)n);
             for (Py_ssize_t i = 0; i < n; i++) {
                 wal_write_value(&p, PyList_GET_ITEM(as_list, i), line);
             }
@@ -1658,7 +1688,7 @@ _PyWAL_OnCall(_PyInterpreterFrame *frame,
     if (p) {
         wal_write_header(&p, WAL_MUTATE, self_oid, line,
                          (uint16_t)fc->code_idx);
-        wal_write_u16(&p, method_idx);
+        wal_write_uvarint(&p, method_idx);
         uint8_t n_args = oparg > 4 ? 4 : (uint8_t)oparg;
         wal_write_u8(&p, n_args);
         for (int i = 0; i < n_args; i++) {
