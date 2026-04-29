@@ -1061,11 +1061,40 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
             return;
         }
 
-        /* Emit CALL */
+        /* Emit CALL — body carries the caller's source line (where the call
+         * expression appears in the parent frame's source) as a uvarint, so
+         * the loader can render the correct call-stack annotation without
+         * having to infer it from "first BIND in parent after the call"
+         * (which fails when STORE_FAST is elided, e.g. mutable-default-arg
+         * rebinds where the returned object's identity is unchanged).
+         *
+         * Caller line is 0 when there's no Python parent frame (top-level
+         * entry, or an interpreter-owned entry frame). For stdlib parents
+         * (callbacks crossing user→stdlib→user) the field carries the
+         * stdlib's line and the loader walks up to the nearest user frame
+         * at render time using its existing classifier. */
         {
-            uint8_t *p = wal_reserve(WAL_HEADER_MAX);
+            /* Walk up frame->previous, skipping any interpreter-owned entry
+             * frames (the dispatch trampolines that don't represent a
+             * Python source position). For typical user→user calls this
+             * is just one hop. For class instantiation `Counter()` the
+             * tp_call dispatch path may interpose entry frames between
+             * __init__ and the caller's user frame; walking past them
+             * surfaces the caller's actual line — what settrace's f_back
+             * mirror would also yield. */
+            uint32_t caller_line = 0;
+            _PyInterpreterFrame *prev = frame->previous;
+            while (prev != NULL && prev->owner == FRAME_OWNED_BY_INTERPRETER) {
+                prev = prev->previous;
+            }
+            if (prev != NULL) {
+                int32_t cl = get_current_line(prev);
+                if (cl > 0) caller_line = (uint32_t)cl;
+            }
+            uint8_t *p = wal_reserve(WAL_HEADER_MAX + 5);
             if (p) {
                 wal_write_header(&p, WAL_CALL, 0, line, (uint16_t)code_idx);
+                wal_write_uvarint(&p, caller_line);
                 wal_finish(p);
             }
         }
