@@ -1084,7 +1084,13 @@ _PyWAL_OnResume(_PyInterpreterFrame *frame, int oparg)
              * mirror would also yield. */
             uint32_t caller_line = 0;
             _PyInterpreterFrame *prev = frame->previous;
-            while (prev != NULL && prev->owner == FRAME_OWNED_BY_INTERPRETER) {
+            /* Match CPython's own pattern in pycore_interpframe.h: any
+             * owner value at-or-above INTERPRETER is treated as a
+             * synthetic frame without a usable Python source position.
+             * Today INTERPRETER is the only such value, but using >=
+             * here means future synthetic-owner additions are skipped
+             * automatically without us needing a fork edit. */
+            while (prev != NULL && prev->owner >= FRAME_OWNED_BY_INTERPRETER) {
                 prev = prev->previous;
             }
             if (prev != NULL) {
