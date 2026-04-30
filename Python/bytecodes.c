@@ -1504,8 +1504,24 @@ dummy_func(
 
         tier1 inst(RAISE_VARARGS, (args[oparg] -- )) {
             assert(oparg < 3);
-            if (_PyWAL_enabled && oparg > 0) {
-                _PyWAL_OnRaise(frame, PyStackRef_AsPyObjectBorrow(args[0]));
+            if (_PyWAL_enabled) {
+                if (oparg > 0) {
+                    _PyWAL_OnRaise(frame, PyStackRef_AsPyObjectBorrow(args[0]));
+                } else {
+                    /* Bare `raise` re-raise. The exception about to be
+                     * re-raised lives in tstate->exc_info (the currently-
+                     * handled exception inside an except clause), not in
+                     * tstate's pending-exception slot. Fire OnRaise here
+                     * so the line table maps to the source line of the
+                     * `raise` statement; the exception_unwind path
+                     * (line ~6359) also fires OnRaise but by then
+                     * instr_ptr has moved to a synthetic cleanup position
+                     * whose line maps to -1. */
+                    PyObject *cur_exc = tstate->exc_info ? tstate->exc_info->exc_value : NULL;
+                    if (cur_exc) {
+                        _PyWAL_OnRaise(frame, cur_exc);
+                    }
+                }
             }
             PyObject *cause = oparg == 2 ? PyStackRef_AsPyObjectSteal(args[1]) : NULL;
             PyObject *exc = oparg > 0 ? PyStackRef_AsPyObjectSteal(args[0]) : NULL;

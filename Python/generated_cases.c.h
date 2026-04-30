@@ -10650,10 +10650,30 @@
             _PyStackRef *args;
             args = &stack_pointer[-oparg];
             assert(oparg < 3);
-            if (_PyWAL_enabled && oparg > 0) {
-                _PyFrame_SetStackPointer(frame, stack_pointer);
-                _PyWAL_OnRaise(frame, PyStackRef_AsPyObjectBorrow(args[0]));
-                stack_pointer = _PyFrame_GetStackPointer(frame);
+            if (_PyWAL_enabled) {
+                if (oparg > 0) {
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    _PyWAL_OnRaise(frame, PyStackRef_AsPyObjectBorrow(args[0]));
+                    stack_pointer = _PyFrame_GetStackPointer(frame);
+                } else {
+                    /* Bare `raise` re-raise: fire OnRaise here while
+                     * instr_ptr is still at this RAISE_VARARGS, so the
+                     * line table maps to the source line of the `raise`
+                     * statement. The exception we're about to re-raise
+                     * lives in tstate->exc_info (the currently-handled
+                     * exception inside an except clause), not in tstate's
+                     * pending-exception slot — that one's already been
+                     * captured by the matching except. The exception_unwind
+                     * path further down also fires OnRaise but by then
+                     * instr_ptr has moved to a synthetic cleanup position
+                     * whose line maps to -1. */
+                    _PyFrame_SetStackPointer(frame, stack_pointer);
+                    PyObject *cur_exc = tstate->exc_info ? tstate->exc_info->exc_value : NULL;
+                    if (cur_exc) {
+                        _PyWAL_OnRaise(frame, cur_exc);
+                    }
+                    stack_pointer = _PyFrame_GetStackPointer(frame);
+                }
             }
             PyObject *cause = oparg == 2 ? PyStackRef_AsPyObjectSteal(args[1]) : NULL;
             PyObject *exc = oparg > 0 ? PyStackRef_AsPyObjectSteal(args[0]) : NULL;
